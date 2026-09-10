@@ -1,0 +1,17 @@
+#!/bin/sh
+# Launch the local freemem/gpuwatch MCP server over stdio.
+# Keep stdout reserved for MCP protocol messages.
+
+# MCP hosts commonly launch stdio servers with a minimal environment. Supply
+# the local X context when it was omitted so nvidia-settings can expose clock
+# offsets; telemetry still works if no X display is available.
+if [ -z "${DISPLAY:-}" ]; then
+    DISPLAY=:0
+    export DISPLAY
+fi
+if [ -z "${XAUTHORITY:-}" ] && [ -r "${HOME:-}/.Xauthority" ]; then
+    XAUTHORITY="${HOME}/.Xauthority"
+    export XAUTHORITY
+fi
+
+exec /home/sojun/.local/bin/uv run --with 'mcp[cli]' mcp run /home/sojun/freemem/freemem_mcp.py "$@"

@@ -1,0 +1,442 @@
+#!/usr/bin/env bash
+# gpuwatch - live NVIDIA GPU settings and telemetry watcher.
+#
+# This intentionally focuses on the GPU itself: temperatures, power, memory,
+# clocks, and driver-exposed overclock settings. It does not list processes.
+
+set -u
+
+LC_ALL=C
+export LC_ALL
+
+interval=1
+gpu_filter=''
+once=0
+positional_refresh_rate=0
+
+if [[ -t 1 ]]; then
+    cyan=$'\033[36m'
+    green=$'\033[32m'
+    yellow=$'\033[33m'
+    red=$'\033[31m'
+    dim=$'\033[2m'
+    reset=$'\033[0m'
+    show_cursor=$'\033[?25h'
+else
+    cyan=''
+    green=''
+    yellow=''
+    red=''
+    dim=''
+    reset=''
+    show_cursor=''
+fi
+
+usage() {
+    cat <<EOF
+Usage: ${0##*/} [REFRESH_RATE] [OPTIONS]
+
+Live NVIDIA GPU settings and telemetry watcher.
+
+Argument:
+  REFRESH_RATE             Refresh rate in seconds (for example: 1, 1.0, .5)
+
+Options:
+  -r, --refresh-rate SEC   Refresh rate in seconds (default: 1)
+  -i, --interval SEC       Alias for --refresh-rate
+  -g, --gpu INDEX         Show only one nvidia-smi GPU index
+  -1, --once              Print one snapshot and exit
+  -h, --help              Show this help
+
+Displayed values include GPU and memory temperature, power draw and limit,
+VRAM usage, utilization, current core/memory clocks, fan speed, P-state, and
+core/memory clock offsets from nvidia-settings when available.
+
+Press Ctrl-C to exit live mode.
+EOF
+}
+
+die() {
+    printf '%s\n' "$*" >&2
+    exit 2
+}
+
+trim() {
+    local value=${1-}
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    printf '%s' "$value"
+}
+
+is_number() {
+    [[ ${1-} =~ ^[0-9]+([.][0-9]+)?$ ]]
+}
+
+fmt_mem() {
+    local value=${1-}
+    if ! is_number "$value"; then
+        printf '%s' "${value:-N/A}"
+        return
+    fi
+    awk -v m="$value" 'BEGIN {
+        if (m >= 1024 * 1024) printf "%.2f TiB", m / (1024 * 1024)
+        else if (m >= 1024) printf "%.2f GiB", m / 1024
+        else printf "%.0f MiB", m
+    }'
+}
+
+fmt_watts() {
+    local value=${1-}
+    if is_number "$value"; then
+        printf '%.2f W' "$value"
+    else
+        printf '%s' "${value:-N/A}"
+    fi
+}
+
+fmt_mhz() {
+    local value=${1-}
+    if is_number "$value"; then
+        printf '%.0f MHz' "$value"
+    else
+        printf '%s' "${value:-N/A}"
+    fi
+}
+
+fmt_offset() {
+    local value=${1-}
+    if ! is_number "$value" && [[ ! $value =~ ^-[0-9]+([.][0-9]+)?$ ]]; then
+        printf '%s' "${value:-N/A}"
+    elif [[ $value == -* ]]; then
+        printf '%s MHz' "$value"
+    else
+        printf '+%s MHz' "$value"
+    fi
+}
+
+fmt_temp() {
+    local value=${1-}
+    if is_number "$value"; then
+        printf '%.0f°C' "$value"
+    else
+        printf '%s' "${value:-N/A}"
+    fi
+}
+
+fmt_percent() {
+    local value=${1-}
+    if is_number "$value"; then
+        printf '%.0f%%' "$value"
+    else
+        printf '%s' "${value:-N/A}"
+    fi
+}
+
+fmt_integer() {
+    local value=${1-}
+    if is_number "$value"; then
+        printf '%.0f' "$value"
+    else
+        printf '%s' "${value:-N/A}"
+    fi
+}
+
+fmt_offset_short() {
+    local value=${1-}
+    if ! is_number "$value" && [[ ! $value =~ ^-[0-9]+([.][0-9]+)?$ ]]; then
+        printf '%s' "${value:-N/A}"
+    elif [[ $value == -* ]]; then
+        printf '%s' "$value"
+    else
+        printf '+%s' "$value"
+    fi
+}
+
+fmt_temp_field() {
+    local value=${1-}
+    if is_number "$value"; then
+        printf '%3.0f°C' "$value"
+    else
+        printf '%4s' "${value:-N/A}"
+    fi
+}
+
+temp_field() {
+    local value=${1-}
+    local field
+    field=$(fmt_temp_field "$value")
+    if ! is_number "$value"; then
+        printf '%s' "$field"
+    elif awk -v t="$value" 'BEGIN { exit !(t > 82) }'; then
+        printf '%s%s%s' "$red" "$field" "$reset"
+    elif awk -v t="$value" 'BEGIN { exit !(t > 75) }'; then
+        printf '%s%s%s' "$yellow" "$field" "$reset"
+    else
+        printf '%s%s%s' "$green" "$field" "$reset"
+    fi
+}
+
+memory_temp_field() {
+    local value=${1-}
+    local field
+    field=$(fmt_temp_field "$value")
+    if ! is_number "$value"; then
+        printf '%s' "$field"
+    elif awk -v t="$value" 'BEGIN { exit !(t > 95) }'; then
+        printf '%s%s%s' "$red" "$field" "$reset"
+    elif awk -v t="$value" 'BEGIN { exit !(t > 85) }'; then
+        printf '%s%s%s' "$yellow" "$field" "$reset"
+    else
+        printf '%s%s%s' "$green" "$field" "$reset"
+    fi
+}
+
+fmt_percent_field() {
+    local value=${1-}
+    if is_number "$value"; then
+        printf '%3.0f%%' "$value"
+    else
+        printf '%3s' "${value:-N/A}"
+    fi
+}
+
+fan_field() {
+    local value=${1-}
+    local field
+    field=$(fmt_percent_field "$value")
+    if ! is_number "$value"; then
+        printf '%s' "$field"
+    elif awk -v f="$value" 'BEGIN { exit !(f > 80) }'; then
+        printf '%s%s%s' "$red" "$field" "$reset"
+    else
+        printf '%s%s%s' "$green" "$field" "$reset"
+    fi
+}
+
+fmt_gib_field() {
+    local value=${1-}
+    if is_number "$value"; then
+        awk -v m="$value" 'BEGIN { printf "%5.2f", m / 1024 }'
+    else
+        printf '%5s' "${value:-N/A}"
+    fi
+}
+
+fmt_power_pair() {
+    local draw=${1-} limit=${2-}
+    local draw_field limit_field
+    draw_field=$(fmt_integer "$draw")
+    limit_field=$(fmt_integer "$limit")
+    printf '%3s/%3sW' "$draw_field" "$limit_field"
+}
+
+fmt_clock_pair() {
+    local core=${1-} memory=${2-}
+    printf '%4s / %5s MHz' "$(fmt_integer "$core")" "$(fmt_integer "$memory")"
+}
+
+util_field() {
+    local value=${1-}
+    local field
+    field=$(fmt_percent_field "$value")
+    if ! is_number "$value"; then
+        printf '%s' "$field"
+    else
+        printf '%s%s%s' "$green" "$field" "$reset"
+    fi
+}
+
+capacity_field() {
+    local value=${1-}
+    local field
+    field=$(fmt_percent_field "$value")
+    if ! is_number "$value"; then
+        printf '%s' "$field"
+    elif awk -v u="$value" 'BEGIN { exit !(u >= 90) }'; then
+        printf '%s%s%s' "$red" "$field" "$reset"
+    elif awk -v u="$value" 'BEGIN { exit !(u >= 70) }'; then
+        printf '%s%s%s' "$yellow" "$field" "$reset"
+    else
+        printf '%s%s%s' "$green" "$field" "$reset"
+    fi
+}
+
+memory_percent() {
+    local used=${1-} total=${2-}
+    if is_number "$used" && is_number "$total" && [[ $total != 0 ]]; then
+        awk -v u="$used" -v t="$total" 'BEGIN { printf "%.0f", (u / t) * 100 }'
+    else
+        printf 'N/A'
+    fi
+}
+
+overclock_offsets_for_bus() {
+    local bus_decimal=$1
+    local settings_gpu=${settings_gpu_by_bus[$bus_decimal]-}
+    local core_offset memory_offset
+
+    if [[ -z $settings_gpu ]] || ! command -v nvidia-settings >/dev/null 2>&1; then
+        printf 'N/A\tN/A\n'
+        return
+    fi
+
+    core_offset=$(nvidia-settings -q "[gpu:${settings_gpu}]/GPUGraphicsClockOffset" -t 2>/dev/null | head -n 1 | tr -d '[:space:]')
+    memory_offset=$(nvidia-settings -q "[gpu:${settings_gpu}]/GPUMemoryTransferRateOffset" -t 2>/dev/null | head -n 1 | tr -d '[:space:]')
+    printf '%s\t%s\n' "${core_offset:-N/A}" "${memory_offset:-N/A}"
+}
+
+discover_settings_gpus() {
+    local settings_gpu bus
+    settings_gpu_by_bus=()
+
+    if ! command -v nvidia-settings >/dev/null 2>&1; then
+        return
+    fi
+
+    # nvidia-settings GPU indices do not necessarily match nvidia-smi indices.
+    # Match them through the PCI bus number instead.
+    for settings_gpu in $(seq 0 31); do
+        bus=$(nvidia-settings -q "[gpu:${settings_gpu}]/PCIBus" -t 2>/dev/null | head -n 1 | tr -d '[:space:]')
+        if [[ ! $bus =~ ^[0-9]+$ ]]; then
+            [[ $settings_gpu -gt 0 ]] && break
+            continue
+        fi
+        settings_gpu_by_bus[$bus]=$settings_gpu
+    done
+}
+
+render_snapshot() {
+    local rows
+    local index name pci_bus_id gpu_temp memory_temp power_draw power_limit
+    local memory_used memory_total gpu_util memory_util current_graphics current_memory fan pstate
+    local bus_hex bus_decimal offsets core_offset memory_offset memory_pct
+    local rendered=0
+
+    rows=$(nvidia-smi --query-gpu=index,name,pci.bus_id,temperature.gpu,temperature.memory,power.draw,power.limit,memory.used,memory.total,utilization.gpu,utilization.memory,clocks.current.graphics,clocks.current.memory,fan.speed,pstate --format=csv,noheader,nounits 2>/dev/null) || {
+        printf '%sUnable to read GPU data from nvidia-smi.%s\n' "$red" "$reset"
+        return 1
+    }
+
+    if [[ -z $rows ]]; then
+        printf '%sNo NVIDIA GPUs were reported by nvidia-smi.%s\n' "$red" "$reset"
+        return 1
+    fi
+
+    while IFS=',' read -r index name pci_bus_id gpu_temp memory_temp power_draw power_limit memory_used memory_total gpu_util memory_util current_graphics current_memory fan pstate; do
+        index=$(trim "$index")
+        [[ -z $index ]] && continue
+        if [[ -n $gpu_filter && $index != "$gpu_filter" ]]; then
+            continue
+        fi
+
+        name=$(trim "$name")
+        name=${name#NVIDIA }
+        name=${name#GeForce }
+        pci_bus_id=$(trim "$pci_bus_id")
+        gpu_temp=$(trim "$gpu_temp")
+        memory_temp=$(trim "$memory_temp")
+        power_draw=$(trim "$power_draw")
+        power_limit=$(trim "$power_limit")
+        memory_used=$(trim "$memory_used")
+        memory_total=$(trim "$memory_total")
+        gpu_util=$(trim "$gpu_util")
+        memory_util=$(trim "$memory_util")
+        current_graphics=$(trim "$current_graphics")
+        current_memory=$(trim "$current_memory")
+        fan=$(trim "$fan")
+        pstate=$(trim "$pstate")
+
+        bus_hex=${pci_bus_id#*:}
+        bus_hex=${bus_hex%%:*}
+        if [[ $bus_hex =~ ^[0-9A-Fa-f]+$ ]]; then
+            bus_decimal=$((16#$bus_hex))
+        else
+            bus_decimal=''
+        fi
+
+        offsets=$(overclock_offsets_for_bus "$bus_decimal")
+        IFS=$'\t' read -r core_offset memory_offset <<< "$offsets"
+        memory_pct=$(memory_percent "$memory_used" "$memory_total")
+
+        printf '%s%-12.12s%s | GPU %s | Mem %s | %s | %s | VRAM %s/%s GiB (%s) | MEM %s | CLK %s | FAN %s | Core %4s | Mem %4s | %2s%s\n' \
+            "$cyan" "$name" "$reset" \
+            "$(temp_field "$gpu_temp")" "$(memory_temp_field "$memory_temp")" \
+            "$(util_field "$gpu_util")" "$(fmt_power_pair "$power_draw" "$power_limit")" \
+            "$(fmt_gib_field "$memory_used")" "$(fmt_gib_field "$memory_total")" \
+            "$(capacity_field "$memory_pct")" "$(util_field "$memory_util")" \
+            "$(fmt_clock_pair "$current_graphics" "$current_memory")" \
+            "$(fan_field "$fan")" "$(fmt_offset_short "$core_offset")" \
+            "$(fmt_offset_short "$memory_offset")" "${pstate:-N/A}" "$reset"
+        rendered=1
+    done <<< "$rows"
+
+    if (( rendered == 0 )); then
+        printf '%sNo matching NVIDIA GPU was found.%s\n' "$red" "$reset"
+        return 1
+    fi
+}
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -r|--refresh-rate|-i|--interval)
+            [[ $# -ge 2 ]] || die "${1} requires a value."
+            interval=$2
+            shift 2
+            ;;
+        -g|--gpu)
+            [[ $# -ge 2 ]] || die "${1} requires a GPU index."
+            gpu_filter=$2
+            shift 2
+            ;;
+        -1|--once)
+            once=1
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            if [[ $positional_refresh_rate == 0 && $1 =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]]; then
+                interval=$1
+                positional_refresh_rate=1
+                shift
+            else
+                die "Unknown option: $1 (try --help)."
+            fi
+            ;;
+    esac
+done
+
+if [[ ! $interval =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]] || ! awk -v n="$interval" 'BEGIN { exit !(n > 0) }'; then
+    die "Refresh rate must be a positive number, such as 1, 1.0, .5, or 2.3."
+fi
+if [[ -n $gpu_filter && ! $gpu_filter =~ ^[0-9]+$ ]]; then
+    die "GPU index must be a non-negative integer."
+fi
+command -v nvidia-smi >/dev/null 2>&1 || die 'nvidia-smi is required.'
+
+discover_settings_gpus
+
+trap 'printf "%s%s" "$reset" "$show_cursor"; exit 0' INT TERM
+
+while :; do
+    # Collect everything before touching the terminal. Offset queries can take
+    # noticeably longer than nvidia-smi, so clearing first would cause a blink.
+    snapshot=$(render_snapshot)
+    frame=$(printf '%sGPU WATCH%s  %s%s%s  refresh %ss\n\n%s' \
+        "$cyan" "$reset" "$dim" "$(date '+%Y-%m-%d %H:%M:%S')" "$reset" "$interval" "$snapshot")
+
+    if [[ -t 1 ]]; then
+        # Send the completed frame in one write. Clear each line in place and
+        # clear only anything left below the new frame; do not blank the whole
+        # terminal first, which is what causes visible flashing.
+        drawn_frame=${frame//$'\n'/$'\n\033[2K'}
+        printf '\033[H\033[?25l\033[2K%s\033[J%s' "$drawn_frame" "$show_cursor"
+    else
+        printf '%s\n' "$frame"
+    fi
+
+    (( once == 1 )) && break
+    sleep "$interval"
+done
