@@ -12,9 +12,11 @@ from __future__ import annotations
 import csv
 import io
 import json
+import os
 import re
 import shutil
 import subprocess
+import time
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
@@ -23,7 +25,16 @@ from typing import Any
 from mcp.server import MCPServer
 
 
-mcp = MCPServer("freemem-gpuwatch")
+mcp = MCPServer(
+    "freemem-gpuwatch",
+    version="0.2.0",
+    instructions=(
+        "Use host_stats for a quick read-only CPU, RAM, root-disk, and GPU snapshot. "
+        "Use gpu_stats for detailed GPU temperatures, power, VRAM, clocks, fans, "
+        "P-state, and overclock offsets. Use memory_stats for RAM and top RSS processes. "
+        "Values are live snapshots; null means the host or driver does not expose a field."
+    ),
+)
 
 GPU_QUERY_FIELDS = [
     "index",
@@ -314,6 +325,78 @@ def _memory_snapshot(process_limit: int) -> dict[str, Any]:
     }
 
 
+def _cpu_snapshot() -> dict[str, Any]:
+    """Read load averages and a short /proc/stat utilization sample."""
+
+    result: dict[str, Any] = {
+        "logical_cpus": os.cpu_count(),
+        "load_average": {"1m": None, "5m": None, "15m": None},
+        "usage_percent": None,
+    }
+    try:
+        load_1m, load_5m, load_15m = os.getloadavg()
+        result["load_average"] = {
+            "1m": round(load_1m, 2),
+            "5m": round(load_5m, 2),
+            "15m": round(load_15m, 2),
+        }
+    except OSError:
+        pass
+
+    def read_cpu_counters() -> tuple[int, int] | None:
+        try:
+            first_line = Path("/proc/stat").read_text().splitlines()[0]
+            fields = first_line.split()
+            if fields[0] != "cpu" or len(fields) < 5:
+                return None
+            counters = [int(value) for value in fields[1:]]
+            idle = counters[3] + (counters[4] if len(counters) > 4 else 0)
+            return sum(counters), idle
+        except (IndexError, OSError, ValueError):
+            return None
+
+    first = read_cpu_counters()
+    if first is not None:
+        time.sleep(0.05)
+        second = read_cpu_counters()
+        if second is not None:
+            total_delta = second[0] - first[0]
+            idle_delta = second[1] - first[1]
+            if total_delta > 0:
+                result["usage_percent"] = round(
+                    max(0.0, min(100.0, (total_delta - idle_delta) / total_delta * 100)),
+                    1,
+                )
+    return result
+
+
+def _disk_snapshot() -> dict[str, Any]:
+    """Read usage for the host root filesystem without walking mount points."""
+
+    try:
+        usage = shutil.disk_usage("/")
+    except OSError as exc:
+        return {"available": False, "path": "/", "error": str(exc)}
+    return {
+        "available": True,
+        "path": "/",
+        "total_bytes": usage.total,
+        "used_bytes": usage.used,
+        "free_bytes": usage.free,
+        "used_percent": round(usage.used / usage.total * 100, 1) if usage.total else None,
+    }
+
+
+def _host_snapshot(process_limit: int) -> dict[str, Any]:
+    return {
+        "timestamp": _now(),
+        "cpu": _cpu_snapshot(),
+        "memory": _memory_snapshot(process_limit),
+        "disk": _disk_snapshot(),
+        "gpu": _gpu_snapshot(),
+    }
+
+
 @mcp.tool()
 def gpu_stats(gpu_index: int | None = None) -> dict[str, Any]:
     """Read current GPU temperatures, power, VRAM, clocks, fans, and overclock offsets.
@@ -339,15 +422,26 @@ def memory_stats(process_limit: int = 15) -> dict[str, Any]:
 
 @mcp.tool()
 def system_snapshot(process_limit: int = 15) -> dict[str, Any]:
-    """Read a fresh combined GPU, VRAM, RAM, and top-process snapshot."""
+    """Read a fresh combined CPU, RAM, root-disk, GPU, and top-process snapshot."""
 
     if process_limit < 0 or process_limit > 100:
         raise ValueError("process_limit must be between 0 and 100")
-    return {
-        "timestamp": _now(),
-        "gpu": _gpu_snapshot(),
-        "memory": _memory_snapshot(process_limit),
-    }
+    return _host_snapshot(process_limit)
+
+
+@mcp.tool()
+def host_stats(process_limit: int = 5) -> dict[str, Any]:
+    """Read one quick, read-only host snapshot: CPU load, RAM, root disk, and GPU stats.
+
+    This is the preferred tool for a general machine-health check. It includes
+    top RAM-consuming processes, current GPU temperatures, power, VRAM, clocks,
+    fan speed, P-state, and overclock offsets. Values are numeric where
+    supported and null when the host does not expose them.
+    """
+
+    if process_limit < 0 or process_limit > 100:
+        raise ValueError("process_limit must be between 0 and 100")
+    return _host_snapshot(process_limit)
 
 
 if __name__ == "__main__":
