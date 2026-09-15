@@ -76,6 +76,27 @@ is_number() {
     [[ ${1-} =~ ^[0-9]+([.][0-9]+)?$ ]]
 }
 
+gpu_display_name() {
+    local name=${1-} device_id=${2-} memory_total=${3-}
+    local normalized_device_id=${device_id,,}
+    normalized_device_id=${normalized_device_id#0x}
+
+    # NVIDIA's driver reports CMP 170HX boards as "NVIDIA Graphics Device",
+    # but the PCI device ID identifies GA100/CMP 170HX unambiguously.
+    if [[ $normalized_device_id == 20c2* ]]; then
+        if [[ $memory_total =~ ^[0-9]+$ ]] && (( memory_total >= 60000 )); then
+            printf 'CMP 170HX 64G'
+        else
+            printf 'CMP 170HX'
+        fi
+        return
+    fi
+
+    name=${name#NVIDIA }
+    name=${name#GeForce }
+    printf '%s' "$name"
+}
+
 fmt_mem() {
     local value=${1-}
     if ! is_number "$value"; then
@@ -560,7 +581,7 @@ render_snapshot() {
     local settings_current_graphics settings_max_graphics settings_current_memory settings_max_memory
     local rendered=0
 
-    rows=$(nvidia-smi --query-gpu=index,name,pci.bus_id,temperature.gpu,temperature.memory,power.draw,power.limit,memory.used,memory.total,utilization.gpu,utilization.memory,clocks.current.graphics,clocks.max.graphics,clocks.current.memory,clocks.max.memory,fan.speed,pstate --format=csv,noheader,nounits 2>/dev/null) || {
+    rows=$(nvidia-smi --query-gpu=index,name,pci.bus_id,pci.device_id,temperature.gpu,temperature.memory,power.draw,power.limit,memory.used,memory.total,utilization.gpu,utilization.memory,clocks.current.graphics,clocks.max.graphics,clocks.current.memory,clocks.max.memory,fan.speed,pstate --format=csv,noheader,nounits 2>/dev/null) || {
         printf '%sUnable to read GPU data from nvidia-smi.%s\n' "$red" "$reset"
         return 1
     }
@@ -572,7 +593,7 @@ render_snapshot() {
 
     nvml_offsets_for_gpus
 
-    while IFS=',' read -r index name pci_bus_id gpu_temp memory_temp power_draw power_limit memory_used memory_total gpu_util memory_util current_graphics max_graphics current_memory max_memory fan pstate; do
+    while IFS=',' read -r index name pci_bus_id pci_device_id gpu_temp memory_temp power_draw power_limit memory_used memory_total gpu_util memory_util current_graphics max_graphics current_memory max_memory fan pstate; do
         index=$(trim "$index")
         [[ -z $index ]] && continue
         if [[ -n $gpu_filter && $index != "$gpu_filter" ]]; then
@@ -580,9 +601,8 @@ render_snapshot() {
         fi
 
         name=$(trim "$name")
-        name=${name#NVIDIA }
-        name=${name#GeForce }
         pci_bus_id=$(trim "$pci_bus_id")
+        pci_device_id=$(trim "$pci_device_id")
         gpu_temp=$(trim "$gpu_temp")
         memory_temp=$(trim "$memory_temp")
         power_draw=$(trim "$power_draw")
@@ -597,6 +617,7 @@ render_snapshot() {
         max_memory=$(trim "$max_memory")
         fan=$(trim "$fan")
         pstate=$(trim "$pstate")
+        name=$(gpu_display_name "$name" "$pci_device_id" "$memory_total")
 
         if [[ $pci_bus_id =~ :([0-9A-Fa-f]{2}): ]]; then
             bus_hex=${BASH_REMATCH[1]}
@@ -629,7 +650,7 @@ render_snapshot() {
         [[ $settings_max_memory != N/A ]] && max_memory=$settings_max_memory
         memory_pct=$(memory_percent "$memory_used" "$memory_total")
 
-        printf '%s%-12.12s%s |%s/%s |%s |%s | GCLK %s | M %s/%sGB%s | MEM %s | MCLK %s MHz | FAN %s | Core %4s | Mem %4s | %2s%s\n' \
+        printf '%s%-13.13s%s |%s/%s |%s |%s | GCLK %s | M %s/%sGB%s | MEM %s | MCLK %s MHz | FAN %s | Core %4s | Mem %4s | %2s%s\n' \
             "$cyan" "$name" "$reset" \
             "$(temp_compact_field "$gpu_temp")" "$(temp_compact_field "$memory_temp" 85 95)" \
             "$(fmt_percent_field "$gpu_util")" "$(fmt_power_pair "$power_draw" "$power_limit")" \
