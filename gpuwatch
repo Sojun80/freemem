@@ -49,8 +49,9 @@ Options:
   -h, --help              Show this help
 
 Displayed values include GPU and memory temperature, power draw and limit,
-VRAM usage, utilization, current/max graphics and memory clocks, fan speed,
-P-state, and core/memory clock offsets from nvidia-settings when available.
+VRAM usage, utilization, current/max performance-level graphics and memory
+clocks, fan speed, P-state, and core/memory clock offsets from nvidia-settings
+when available.
 
 Press Ctrl-C to exit live mode.
 EOF
@@ -241,9 +242,9 @@ fan_field() {
 fmt_gib_field() {
     local value=${1-}
     if is_number "$value"; then
-        awk -v m="$value" 'BEGIN { printf "%.2f", m / 1024 }'
+        awk -v m="$value" 'BEGIN { printf "%5.2f", m / 1024 }'
     else
-        printf '%s' "${value:-N/A}"
+        printf '%5s' "${value:-N/A}"
     fi
 }
 
@@ -257,7 +258,9 @@ fmt_power_pair() {
 
 fmt_clock_pair() {
     local current=${1-} maximum=${2-}
-    printf '%s/%s' "$(fmt_integer "$current")" "$(fmt_integer "$maximum")"
+    # Reserve room for five-digit memory clocks such as 13801 on both clock
+    # fields, keeping GCLK and MCLK columns aligned as frequencies change.
+    printf '%5s/%5s' "$(fmt_integer "$current")" "$(fmt_integer "$maximum")"
 }
 
 util_field() {
@@ -385,6 +388,41 @@ overclock_offsets_for_bus() {
     printf '%s\t%s\n' "$core_offset" "$memory_offset"
 }
 
+clock_value_from_string() {
+    local value_string=$1 key=$2 value
+
+    if [[ ,$value_string, =~ ,[[:space:]]*${key}=([^,[:space:]]+) ]]; then
+        value=${BASH_REMATCH[1]}
+        if is_number "$value"; then
+            printf '%s' "$value"
+            return 0
+        fi
+    fi
+    return 1
+}
+
+clocks_for_bus() {
+    local bus_decimal=$1
+    local settings_gpu='' clock_string
+    local current_graphics max_graphics current_memory max_memory
+
+    if [[ -n $bus_decimal ]]; then
+        settings_gpu=${settings_gpu_by_bus[$bus_decimal]-}
+    fi
+    if [[ -z $settings_gpu ]] || ! command -v nvidia-settings >/dev/null 2>&1; then
+        printf 'N/A\tN/A\tN/A\tN/A\n'
+        return
+    fi
+
+    clock_string=$(nvidia-settings -q "[gpu:${settings_gpu}]/GPUCurrentClockFreqsString" -t 2>/dev/null \
+        | awk 'NF { print; exit }')
+    current_graphics=$(clock_value_from_string "$clock_string" nvclock || printf 'N/A')
+    max_graphics=$(clock_value_from_string "$clock_string" nvclockmax || printf 'N/A')
+    current_memory=$(clock_value_from_string "$clock_string" memclock || printf 'N/A')
+    max_memory=$(clock_value_from_string "$clock_string" memclockmax || printf 'N/A')
+    printf '%s\t%s\t%s\t%s\n' "$current_graphics" "$max_graphics" "$current_memory" "$max_memory"
+}
+
 discover_settings_gpus() {
     local settings_gpu bus bus_decimal
     settings_gpu_by_bus=()
@@ -414,7 +452,8 @@ render_snapshot() {
     local index name pci_bus_id gpu_temp memory_temp power_draw power_limit
     local memory_used memory_total gpu_util memory_util current_graphics max_graphics
     local current_memory max_memory fan pstate
-    local bus_hex bus_decimal offsets core_offset memory_offset memory_pct
+    local bus_hex bus_decimal offsets clock_values core_offset memory_offset memory_pct
+    local settings_current_graphics settings_max_graphics settings_current_memory settings_max_memory
     local rendered=0
 
     rows=$(nvidia-smi --query-gpu=index,name,pci.bus_id,temperature.gpu,temperature.memory,power.draw,power.limit,memory.used,memory.total,utilization.gpu,utilization.memory,clocks.current.graphics,clocks.max.graphics,clocks.current.memory,clocks.max.memory,fan.speed,pstate --format=csv,noheader,nounits 2>/dev/null) || {
@@ -468,12 +507,18 @@ render_snapshot() {
 
         offsets=$(overclock_offsets_for_bus "$bus_decimal")
         IFS=$'\t' read -r core_offset memory_offset <<< "$offsets"
+        clock_values=$(clocks_for_bus "$bus_decimal")
+        IFS=$'\t' read -r settings_current_graphics settings_max_graphics settings_current_memory settings_max_memory <<< "$clock_values"
+        [[ $settings_current_graphics != N/A ]] && current_graphics=$settings_current_graphics
+        [[ $settings_max_graphics != N/A ]] && max_graphics=$settings_max_graphics
+        [[ $settings_current_memory != N/A ]] && current_memory=$settings_current_memory
+        [[ $settings_max_memory != N/A ]] && max_memory=$settings_max_memory
         memory_pct=$(memory_percent "$memory_used" "$memory_total")
 
-        printf '%s%-12.12s%s | Temp %s/%s | %3s | %s | GCLK %s | M %s/%sGB %s | MEM %s | MCLK %s MHz | FAN %s | Core %4s | Mem %4s | %2s%s\n' \
+        printf '%s%-12.12s%s | %s/%s |%s | %s | GCLK %s | M %s/%sGB %s | MEM %s | MCLK %s MHz | FAN %s | Core %4s | Mem %4s | %2s%s\n' \
             "$cyan" "$name" "$reset" \
             "$(temp_compact_field "$gpu_temp")" "$(temp_compact_field "$memory_temp" 85 95)" \
-            "$(fmt_percent "$gpu_util")" "$(fmt_power_pair "$power_draw" "$power_limit")" \
+            "$(fmt_percent_field "$gpu_util")" "$(fmt_power_pair "$power_draw" "$power_limit")" \
             "$(fmt_clock_pair "$current_graphics" "$max_graphics")" \
             "$(fmt_gib_field "$memory_used")" "$(fmt_gib_field "$memory_total")" \
             "$(capacity_compact_field "$memory_pct")" "$(util_field "$memory_util")" \
