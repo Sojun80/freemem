@@ -14,6 +14,8 @@ interval=1
 gpu_filter=''
 once=0
 positional_refresh_rate=0
+declare -A nvml_core_offsets=()
+declare -A nvml_memory_offsets=()
 
 if [[ -t 1 ]]; then
     cyan=$'\033[36m'
@@ -51,8 +53,8 @@ Options:
 
 Displayed values include GPU and memory temperature, power draw and limit,
 VRAM usage, utilization, current/max performance-level graphics and memory
-clocks, fan speed, P-state, and core/memory clock offsets from nvidia-settings
-when available.
+clocks, fan speed, P-state, and core/memory clock offsets from NVML or
+nvidia-settings when available.
 
 Press Ctrl-C to exit live mode.
 EOF
@@ -318,6 +320,103 @@ memory_percent() {
     fi
 }
 
+nvml_offsets_for_gpus() {
+    nvml_core_offsets=()
+    nvml_memory_offsets=()
+    command -v python3 >/dev/null 2>&1 || return
+
+    while IFS=$'\t' read -r index core_offset memory_offset; do
+        [[ $index =~ ^[0-9]+$ ]] || continue
+        [[ $core_offset =~ ^-?[0-9]+$ ]] && nvml_core_offsets[$index]=$core_offset
+        [[ $memory_offset =~ ^-?[0-9]+$ ]] && nvml_memory_offsets[$index]=$memory_offset
+    done < <(
+        python3 - <<'PY' 2>/dev/null
+import ctypes
+
+try:
+    nvml = ctypes.CDLL("libnvidia-ml.so.1")
+    nvml_init = nvml.nvmlInit_v2
+    nvml_shutdown = nvml.nvmlShutdown
+    get_count = nvml.nvmlDeviceGetCount_v2
+    get_handle = nvml.nvmlDeviceGetHandleByIndex_v2
+except (AttributeError, OSError):
+    raise SystemExit(0)
+
+nvml_init.restype = ctypes.c_int
+if nvml_init() != 0:
+    raise SystemExit(0)
+
+get_count.argtypes = [ctypes.POINTER(ctypes.c_uint)]
+get_count.restype = ctypes.c_int
+get_handle.argtypes = [ctypes.c_uint, ctypes.POINTER(ctypes.c_void_p)]
+get_handle.restype = ctypes.c_int
+
+class ClockOffset(ctypes.Structure):
+    _fields_ = [
+        ("version", ctypes.c_uint),
+        ("type", ctypes.c_uint),
+        ("pstate", ctypes.c_uint),
+        ("clock_offset_mhz", ctypes.c_int),
+        ("min_clock_offset_mhz", ctypes.c_int),
+        ("max_clock_offset_mhz", ctypes.c_int),
+    ]
+
+get_clock_offsets = getattr(nvml, "nvmlDeviceGetClockOffsets", None)
+if get_clock_offsets is not None:
+    get_clock_offsets.argtypes = [ctypes.c_void_p, ctypes.POINTER(ClockOffset)]
+    get_clock_offsets.restype = ctypes.c_int
+
+get_core_offset = getattr(nvml, "nvmlDeviceGetGpcClkVfOffset", None)
+get_memory_offset = getattr(nvml, "nvmlDeviceGetMemClkVfOffset", None)
+if get_core_offset is not None:
+    get_core_offset.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
+    get_core_offset.restype = ctypes.c_int
+if get_memory_offset is not None:
+    get_memory_offset.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
+    get_memory_offset.restype = ctypes.c_int
+
+count = ctypes.c_uint()
+if get_count(ctypes.byref(count)) != 0:
+    nvml_shutdown()
+    raise SystemExit(0)
+
+def new_offset(handle, clock_type):
+    if get_clock_offsets is None:
+        return None
+    first_value = None
+    for pstate in range(16):
+        info = ClockOffset(ctypes.sizeof(ClockOffset) | (1 << 24), clock_type, pstate, 0, 0, 0)
+        if get_clock_offsets(handle, ctypes.byref(info)) == 0:
+            if first_value is None:
+                first_value = info.clock_offset_mhz
+            if info.clock_offset_mhz != 0:
+                return info.clock_offset_mhz
+    return first_value
+
+for index in range(count.value):
+    handle = ctypes.c_void_p()
+    if get_handle(index, ctypes.byref(handle)) != 0:
+        continue
+
+    core = new_offset(handle, 0)
+    memory = new_offset(handle, 2)
+
+    if core is None and get_core_offset is not None:
+        value = ctypes.c_int()
+        if get_core_offset(handle, ctypes.byref(value)) == 0:
+            core = value.value
+    if memory is None and get_memory_offset is not None:
+        value = ctypes.c_int()
+        if get_memory_offset(handle, ctypes.byref(value)) == 0:
+            memory = value.value
+
+    print(index, core if core is not None else "N/A", memory if memory is not None else "N/A", sep="\t")
+
+nvml_shutdown()
+PY
+    )
+}
+
 query_settings_value() {
     local settings_gpu=$1 attribute=$2 value
 
@@ -471,6 +570,8 @@ render_snapshot() {
         return 1
     fi
 
+    nvml_offsets_for_gpus
+
     while IFS=',' read -r index name pci_bus_id gpu_temp memory_temp power_draw power_limit memory_used memory_total gpu_util memory_util current_graphics max_graphics current_memory max_memory fan pstate; do
         index=$(trim "$index")
         [[ -z $index ]] && continue
@@ -510,8 +611,16 @@ render_snapshot() {
             bus_decimal=''
         fi
 
-        offsets=$(overclock_offsets_for_bus "$bus_decimal")
-        IFS=$'\t' read -r core_offset memory_offset <<< "$offsets"
+        core_offset=${nvml_core_offsets[$index]-}
+        memory_offset=${nvml_memory_offsets[$index]-}
+        if [[ -z $core_offset || -z $memory_offset ]]; then
+            offsets=$(overclock_offsets_for_bus "$bus_decimal")
+            IFS=$'\t' read -r settings_core_offset settings_memory_offset <<< "$offsets"
+            [[ -n $core_offset ]] || core_offset=$settings_core_offset
+            [[ -n $memory_offset ]] || memory_offset=$settings_memory_offset
+        fi
+        [[ -n $core_offset ]] || core_offset='N/A'
+        [[ -n $memory_offset ]] || memory_offset='N/A'
         clock_values=$(clocks_for_bus "$bus_decimal")
         IFS=$'\t' read -r settings_current_graphics settings_max_graphics settings_current_memory settings_max_memory <<< "$clock_values"
         [[ $settings_current_graphics != N/A ]] && current_graphics=$settings_current_graphics
