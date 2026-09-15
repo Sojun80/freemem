@@ -9,7 +9,7 @@ set -u
 LC_ALL=C
 export LC_ALL
 
-gpuwatch_version='1.0'
+gpuwatch_version='1.01'
 interval=1
 gpu_filter=''
 once=0
