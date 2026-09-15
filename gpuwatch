@@ -9,6 +9,7 @@ set -u
 LC_ALL=C
 export LC_ALL
 
+gpuwatch_version='1.0'
 interval=1
 gpu_filter=''
 once=0
@@ -582,8 +583,8 @@ while :; do
     # Collect everything before touching the terminal. Offset queries can take
     # noticeably longer than nvidia-smi, so clearing first would cause a blink.
     snapshot=$(render_snapshot)
-    frame=$(printf '%sGPU WATCH%s  %s%s%s  refresh %ss\n\n%s' \
-        "$cyan" "$reset" "$dim" "$(date '+%Y-%m-%d %H:%M:%S')" "$reset" "$interval" "$snapshot")
+    frame=$(printf '%sGPUWatch v%s%s  refresh %ss\n\n%s' \
+        "$cyan" "$gpuwatch_version" "$reset" "$interval" "$snapshot")
 
     if [[ -t 1 ]]; then
         # Send the completed frame in one write. Clear each line in place and
