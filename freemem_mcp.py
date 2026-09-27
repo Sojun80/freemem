@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Read-only MCP server for the local freemem and gpuwatch telemetry.
+"""MCP server for local freemem, gpuwatch, and guarded GPU controls.
 
-The server deliberately returns structured values so an AI host can answer
-questions about the machine without parsing the human-oriented shell output.
-It uses nvidia-smi for NVIDIA telemetry, nvidia-settings for overclock offsets,
-and /proc plus ps for the freemem view.
+The server returns structured values so an AI host can answer questions about
+the machine without parsing the human-oriented shell output. It uses
+nvidia-smi for NVIDIA telemetry, nvidia-settings for overclock offsets, and
+/proc plus ps for the freemem view. GPU writes are delegated to gpuoc, which
+keeps the CLI and MCP safety rules in one place.
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import math
 import os
 import re
 import shutil
@@ -27,14 +29,19 @@ from mcp.server import MCPServer
 
 mcp = MCPServer(
     "freemem-gpuwatch",
-    version="0.2.0",
+    version="0.3.0",
     instructions=(
         "Use host_stats for a quick read-only CPU, RAM, root-disk, and GPU snapshot. "
         "Use gpu_stats for detailed GPU temperatures, power, VRAM, clocks, fans, "
-        "P-state, and overclock offsets. Use memory_stats for RAM and top RSS processes. "
-        "Values are live snapshots; null means the host or driver does not expose a field."
+        "P-state, and overclock offsets. Use gpu_apply_overclock or "
+        "gpu_reset_overclock for guarded NVIDIA changes; both require confirm=true "
+        "and never infer confirmation from surrounding conversation. Use memory_stats "
+        "for RAM and top RSS processes. Values are live snapshots; null means the "
+        "host or driver does not expose a field."
     ),
 )
+
+GPUOC_PATH = Path(__file__).with_name("gpuoc")
 
 GPU_QUERY_FIELDS = [
     "index",
@@ -86,6 +93,35 @@ def _run(command: list[str], timeout: float = 4.0) -> tuple[str, str, int]:
     except OSError as exc:
         return "", str(exc), 1
     return result.stdout.strip(), result.stderr.strip(), result.returncode
+
+
+def _run_gpuoc(arguments: list[str], timeout: float = 12.0) -> tuple[str, str, int]:
+    """Run the local guarded GPU control CLI with a small, fixed argument list."""
+
+    if not GPUOC_PATH.is_file() or not os.access(GPUOC_PATH, os.X_OK):
+        return "", f"{GPUOC_PATH} is missing or not executable", 127
+    return _run([str(GPUOC_PATH), *arguments], timeout=timeout)
+
+
+def _control_number(value: Any, name: str, integer: bool = False) -> int | float | None:
+    """Validate an MCP numeric control and return it in a shell-safe form."""
+
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        expected = "an integer" if integer else "a number"
+        raise ValueError(f"{name} must be {expected}")
+    if not math.isfinite(float(value)):
+        raise ValueError(f"{name} must be finite")
+    if integer and not float(value).is_integer():
+        raise ValueError(f"{name} must be an integer")
+    return int(value) if integer else value
+
+
+def _control_text(value: int | float) -> str:
+    if isinstance(value, float):
+        return format(value, ".12f").rstrip("0").rstrip(".")
+    return str(value)
 
 
 def _number(value: str | None, integer: bool = False) -> int | float | None:
@@ -158,13 +194,20 @@ def _overclock_settings(pci_bus_id: str) -> dict[str, int | float | None]:
             "available": False,
             "core_offset_mhz": None,
             "memory_transfer_offset_mhz": None,
+            "vtt_offset_mv": None,
         }
 
+    voltage_offset_uv = _settings_value(settings_gpu, "GPUOverVoltageOffset")
     return {
         "available": True,
         "core_offset_mhz": _settings_value(settings_gpu, "GPUGraphicsClockOffset"),
         "memory_transfer_offset_mhz": _settings_value(
             settings_gpu, "GPUMemoryTransferRateOffset"
+        ),
+        "vtt_offset_mv": (
+            round(voltage_offset_uv / 1000, 1)
+            if isinstance(voltage_offset_uv, (int, float))
+            else None
         ),
     }
 
@@ -409,6 +452,143 @@ def gpu_stats(gpu_index: int | None = None) -> dict[str, Any]:
     if gpu_index is not None and gpu_index < 0:
         raise ValueError("gpu_index must be non-negative")
     return _gpu_snapshot(gpu_index)
+
+
+@mcp.tool()
+def gpu_apply_overclock(
+    gpu_index: int,
+    core_offset_mhz: int | None = None,
+    memory_transfer_offset_mhz: int | None = None,
+    power_limit_w: int | float | None = None,
+    fan_percent: int | None = None,
+    vtt_offset_mv: int | None = None,
+    confirm: bool = False,
+    unsafe: bool = False,
+) -> dict[str, Any]:
+    """Apply guarded NVIDIA GPU controls through the local gpuoc backend.
+
+    Pass only the controls that should change; omitted controls are preserved.
+    This tool never writes unless confirm is explicitly true. Core offsets are
+    capped at +/-500 MHz, memory offsets at +/-3000 MHz, and VTT/GPU voltage
+    offsets at +/-50 mV unless unsafe is explicitly true. The NVIDIA driver
+    still enforces its own supported range, and power_limit_w is checked against
+    each GPU's reported power range by the backend. VTT maps to NVIDIA's
+    GPUOverVoltageOffset control and may be unavailable on newer GeForce
+    drivers. Use gpu_stats first when the current state is not known.
+    """
+
+    if isinstance(gpu_index, bool) or not isinstance(gpu_index, int) or gpu_index < 0:
+        raise ValueError("gpu_index must be a non-negative integer")
+    core = _control_number(core_offset_mhz, "core_offset_mhz", integer=True)
+    memory = _control_number(
+        memory_transfer_offset_mhz,
+        "memory_transfer_offset_mhz",
+        integer=True,
+    )
+    power = _control_number(power_limit_w, "power_limit_w")
+    fan = _control_number(fan_percent, "fan_percent", integer=True)
+    vtt = _control_number(vtt_offset_mv, "vtt_offset_mv", integer=True)
+    if core is None and memory is None and power is None and fan is None and vtt is None:
+        raise ValueError(
+            "provide at least one of core_offset_mhz, "
+            "memory_transfer_offset_mhz, power_limit_w, fan_percent, or vtt_offset_mv"
+        )
+    if core is not None and not unsafe and abs(core) > 500:
+        raise ValueError("core_offset_mhz is capped at +/-500 unless unsafe=true")
+    if memory is not None and not unsafe and abs(memory) > 3000:
+        raise ValueError(
+            "memory_transfer_offset_mhz is capped at +/-3000 unless unsafe=true"
+        )
+    if vtt is not None and not unsafe and abs(vtt) > 50:
+        raise ValueError("vtt_offset_mv is capped at +/-50 unless unsafe=true")
+    if fan is not None and not 20 <= fan <= 100:
+        raise ValueError("fan_percent must be between 20 and 100")
+
+    requested = {
+        "gpu_index": gpu_index,
+        "core_offset_mhz": core,
+        "memory_transfer_offset_mhz": memory,
+        "power_limit_w": power,
+        "fan_percent": fan,
+        "vtt_offset_mv": vtt,
+        "unsafe": unsafe,
+    }
+    if confirm is not True:
+        return {
+            "timestamp": _now(),
+            "available": True,
+            "applied": False,
+            "confirmation_required": True,
+            "requested": requested,
+            "message": "Set confirm=true to authorize the GPU write.",
+        }
+
+    arguments = ["apply", "--gpu", str(gpu_index)]
+    if core is not None:
+        arguments += ["--core", str(core)]
+    if memory is not None:
+        arguments += ["--memory", str(memory)]
+    if power is not None:
+        arguments += ["--power-limit", _control_text(power)]
+    if fan is not None:
+        arguments += ["--fan", str(fan)]
+    if vtt is not None:
+        arguments += ["--vtt", str(vtt)]
+    if unsafe:
+        arguments.append("--unsafe")
+    arguments.append("--yes")
+
+    output, error, status = _run_gpuoc(arguments)
+    result: dict[str, Any] = {
+        "timestamp": _now(),
+        "available": status != 127,
+        "applied": status == 0,
+        "requested": requested,
+        "output": output or None,
+    }
+    if status != 0:
+        result["error"] = error or output or "gpuoc failed to apply the requested controls"
+        return result
+    result["snapshot"] = _gpu_snapshot(gpu_index)
+    return result
+
+
+@mcp.tool()
+def gpu_reset_overclock(gpu_index: int, confirm: bool = False) -> dict[str, Any]:
+    """Reset one NVIDIA GPU to zero offsets, automatic fan, and default power.
+
+    This tool never writes unless confirm is explicitly true. It affects only
+    the GPU identified by gpu_index and delegates the reset to gpuoc.
+    """
+
+    if isinstance(gpu_index, bool) or not isinstance(gpu_index, int) or gpu_index < 0:
+        raise ValueError("gpu_index must be a non-negative integer")
+    requested = {"gpu_index": gpu_index}
+    if confirm is not True:
+        return {
+            "timestamp": _now(),
+            "available": True,
+            "applied": False,
+            "confirmation_required": True,
+            "requested": requested,
+            "message": "Set confirm=true to authorize the GPU reset.",
+        }
+
+    output, error, status = _run_gpuoc(
+        ["reset", "--gpu", str(gpu_index), "--yes"]
+    )
+    result: dict[str, Any] = {
+        "timestamp": _now(),
+        "available": status != 127,
+        "applied": status == 0,
+        "requested": requested,
+        "output": output or None,
+    }
+    if status != 0:
+        result["error"] = error or output or "gpuoc failed to reset the GPU"
+        return result
+    result["snapshot"] = _gpu_snapshot(gpu_index)
+    return result
 
 
 @mcp.tool()
