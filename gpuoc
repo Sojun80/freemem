@@ -1,0 +1,714 @@
+#!/usr/bin/env bash
+# gpuoc - NVIDIA GPU telemetry and guarded control commands.
+#
+# Clock offsets and fan controls are written through nvidia-settings. Power
+# limits are written through nvidia-smi. Hardware writes are currently
+# disabled; --dry-run can preview the commands without changing the GPU.
+
+set -u
+
+LC_ALL=C
+export LC_ALL
+
+# nvidia-settings needs an X display even when the command is launched from
+# a plain shell or an MCP host. A missing display will still be reported as a
+# mapping error rather than permitting an ambiguous write.
+if [[ -z ${DISPLAY:-} ]]; then
+    DISPLAY=:0
+    export DISPLAY
+fi
+
+gpuoc_version='0.1.0'
+hardware_writes_enabled=0
+gpu_filter=''
+all_gpus=0
+assume_yes=0
+dry_run=0
+core_offset=''
+memory_offset=''
+power_limit=''
+fan_speed=''
+vtt_offset_mv=''
+unsafe_offsets=0
+
+declare -A gpu_name=()
+declare -A gpu_bus=()
+declare -A gpu_default_power=()
+declare -A gpu_min_power=()
+declare -A gpu_max_power=()
+declare -A settings_gpu_by_bus=()
+
+cyan=''
+green=''
+yellow=''
+red=''
+dim=''
+reset=''
+if [[ -t 1 ]]; then
+    cyan=$'\033[36m'
+    green=$'\033[32m'
+    yellow=$'\033[33m'
+    red=$'\033[31m'
+    dim=$'\033[2m'
+    reset=$'\033[0m'
+fi
+
+usage() {
+    cat <<EOF
+Usage:
+  ${0##*/} status [--gpu INDEX]
+  ${0##*/} apply --gpu INDEX [CONTROLS] [--yes|--dry-run]
+  ${0##*/} apply --all [CONTROLS] [--yes|--dry-run]
+  ${0##*/} reset --gpu INDEX [--yes|--dry-run]
+  ${0##*/} reset --all [--yes|--dry-run]
+
+NVIDIA GPU status and guarded control command preview.
+
+Hardware writes are disabled. apply/reset only work with --dry-run, which
+prints the proposed nvidia-settings/nvidia-smi commands without executing them.
+
+Controls for apply:
+  --core OFFSET_MHZ       Graphics clock offset, relative to current setting
+  --memory OFFSET_MHZ     Memory transfer-rate offset, relative to current setting
+  --power-limit W         Power target within the driver's reported range
+  --fan PERCENT           Set a manual fan target from 20 to 100 percent
+  --vtt OFFSET_MV         GPU voltage offset, in millivolts, when supported
+
+Options:
+  -g, --gpu INDEX         Select one nvidia-smi GPU
+      --all               Explicitly select every GPU
+      --yes               Skip confirmation (hardware writes remain disabled)
+      --dry-run           Show proposed writes without executing them
+      --unsafe             Allow offsets outside the conservative default caps
+  -h, --help              Show this help
+      --version           Show the tool version
+
+Default offset caps are +/-500 MHz core, +/-3000 MHz memory, and +/-50 mV VTT.
+The NVIDIA driver still validates every setting. Reset clears offsets, restores
+each GPU's default power limit, and returns fan control to automatic mode.
+
+Examples:
+  ${0##*/} status
+  ${0##*/} apply --gpu 0 --core 150 --memory 500 --dry-run
+  ${0##*/} apply --gpu 0 --power-limit 300 --fan 70 --dry-run
+  ${0##*/} reset --gpu 0 --dry-run
+EOF
+}
+
+die() {
+    printf '%s\n' "$*" >&2
+    exit 2
+}
+
+require_hardware_writes_enabled() {
+    (( dry_run || hardware_writes_enabled )) || \
+        die 'GPU hardware writes are disabled; use --dry-run to preview commands.'
+}
+
+trim() {
+    local value=${1-}
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    printf '%s' "$value"
+}
+
+is_number() {
+    [[ ${1-} =~ ^-?[0-9]+([.][0-9]+)?$ ]]
+}
+
+is_integer() {
+    [[ ${1-} =~ ^-?[0-9]+$ ]]
+}
+
+abs_number() {
+    awk -v value="$1" 'BEGIN { if (value < 0) value = -value; printf "%.3f", value }'
+}
+
+fmt_number() {
+    local value=${1-}
+    if is_number "$value"; then
+        awk -v value="$value" 'BEGIN { printf "%.0f", value }'
+    else
+        printf '%s' "${value:-N/A}"
+    fi
+}
+
+fmt_signed() {
+    local value=${1-}
+    if ! is_number "$value"; then
+        printf '%s' "${value:-N/A}"
+    elif [[ $value == -* ]]; then
+        printf '%s MHz' "$value"
+    else
+        printf '+%s MHz' "$value"
+    fi
+}
+
+fmt_watts() {
+    local value=${1-}
+    if is_number "$value"; then
+        awk -v value="$value" 'BEGIN { printf "%.0f W", value }'
+    else
+        printf '%s' "${value:-N/A}"
+    fi
+}
+
+fmt_vtt() {
+    local value=${1-}
+    if is_integer "$value"; then
+        if (( value < 0 )); then
+            printf '%s mV' "$value"
+        else
+            printf '+%s mV' "$value"
+        fi
+    else
+        printf '%s' "${value:-N/A}"
+    fi
+}
+
+fmt_temp() {
+    local value=${1-}
+    if is_number "$value"; then
+        printf '%s°C' "$(fmt_number "$value")"
+    else
+        printf '%s' "${value:-N/A}"
+    fi
+}
+
+fmt_percent() {
+    local value=${1-}
+    if is_number "$value"; then
+        printf '%s%%' "$(fmt_number "$value")"
+    else
+        printf '%s' "${value:-N/A}"
+    fi
+}
+
+require_commands() {
+    command -v nvidia-smi >/dev/null 2>&1 || die 'nvidia-smi is required.'
+}
+
+query_gpu_inventory() {
+    local rows index name bus default_power min_power max_power
+
+    rows=$(nvidia-smi \
+        --query-gpu=index,name,pci.bus_id,power.default_limit,power.min_limit,power.max_limit \
+        --format=csv,noheader,nounits 2>/dev/null) || {
+        die 'Unable to read GPU inventory from nvidia-smi.'
+    }
+    [[ -n $rows ]] || die 'No NVIDIA GPUs were reported by nvidia-smi.'
+
+    gpu_name=()
+    gpu_bus=()
+    gpu_default_power=()
+    gpu_min_power=()
+    gpu_max_power=()
+
+    while IFS=',' read -r index name bus default_power min_power max_power; do
+        index=$(trim "$index")
+        [[ $index =~ ^[0-9]+$ ]] || continue
+        gpu_name[$index]=$(trim "$name")
+        gpu_bus[$index]=$(trim "$bus")
+        gpu_default_power[$index]=$(trim "$default_power")
+        gpu_min_power[$index]=$(trim "$min_power")
+        gpu_max_power[$index]=$(trim "$max_power")
+    done <<< "$rows"
+
+    ((${#gpu_name[@]} > 0)) || die 'nvidia-smi returned no usable GPU records.'
+}
+
+pci_bus_number() {
+    local bus_id=${1-}
+    if [[ $bus_id =~ :([0-9A-Fa-f]{2}): ]]; then
+        printf '%d' "$((16#${BASH_REMATCH[1]}))"
+    elif [[ $bus_id =~ ^([0-9A-Fa-f]{2}): ]]; then
+        printf '%d' "$((16#${BASH_REMATCH[1]}))"
+    fi
+}
+
+discover_settings_gpus() {
+    local settings_gpu bus bus_decimal
+    settings_gpu_by_bus=()
+
+    command -v nvidia-settings >/dev/null 2>&1 || return
+
+    # nvidia-settings indices and nvidia-smi indices can differ. PCI bus
+    # matching keeps a write aimed at the requested physical GPU.
+    for settings_gpu in $(seq 0 31); do
+        bus=$(nvidia-settings -q "[gpu:${settings_gpu}]/PCIBus" -t 2>/dev/null \
+            | awk 'NF { gsub(/[[:space:]]/, ""); print; exit }')
+        if [[ $bus =~ ^0[xX]([0-9A-Fa-f]+)$ ]]; then
+            bus_decimal=$((16#${BASH_REMATCH[1]}))
+        elif [[ $bus =~ ^[0-9]+$ ]]; then
+            bus_decimal=$bus
+        else
+            [[ $settings_gpu -gt 0 ]] && break
+            continue
+        fi
+        settings_gpu_by_bus[$bus_decimal]=$settings_gpu
+    done
+}
+
+settings_index_for_gpu() {
+    local index=$1 bus_decimal
+    bus_decimal=$(pci_bus_number "${gpu_bus[$index]-}")
+    [[ -n $bus_decimal ]] || return 1
+    [[ -n ${settings_gpu_by_bus[$bus_decimal]-} ]] || return 1
+    printf '%s' "${settings_gpu_by_bus[$bus_decimal]}"
+}
+
+query_setting_value() {
+    local settings_gpu=$1 attribute=$2
+    nvidia-settings -q "[gpu:${settings_gpu}]/${attribute}" -t 2>/dev/null \
+        | awk 'match($0, /-?[0-9]+([.][0-9]+)?/) { print substr($0, RSTART, RLENGTH); exit }'
+}
+
+query_offset() {
+    local settings_gpu=$1 attribute=$2
+    local level value first_value='' query_args=()
+
+    # The unindexed attribute is not exposed consistently across driver
+    # versions, so inspect performance levels and prefer a non-zero value.
+    for level in $(seq 0 15); do
+        query_args+=(-q "[gpu:${settings_gpu}]/${attribute}[${level}]")
+    done
+    while IFS= read -r value; do
+        value=$(trim "$value")
+        is_number "$value" || continue
+        [[ -z $first_value ]] && first_value=$value
+        if awk -v n="$value" 'BEGIN { exit !(n != 0) }'; then
+            printf '%s' "$value"
+            return
+        fi
+    done < <(nvidia-settings "${query_args[@]}" -t 2>/dev/null)
+
+    # Some drivers only expose the aggregate form.
+    value=$(query_setting_value "$settings_gpu" "${attribute}AllPerformanceLevels")
+    if [[ -n $value ]]; then
+        if awk -v n="$value" 'BEGIN { exit !(n != 0) }'; then
+            printf '%s' "$value"
+            return
+        fi
+        [[ -z $first_value ]] && first_value=$value
+    fi
+
+    if [[ -n $first_value ]]; then
+        printf '%s' "$first_value"
+    else
+        printf 'N/A'
+    fi
+}
+
+query_vtt_offset() {
+    local settings_gpu=$1 value
+    value=$(query_setting_value "$settings_gpu" GPUOverVoltageOffset)
+    if is_number "$value"; then
+        awk -v value="$value" 'BEGIN { printf "%.0f", value / 1000 }'
+    else
+        printf 'N/A'
+    fi
+}
+
+selected_gpus() {
+    local index
+    if [[ -n $gpu_filter ]]; then
+        [[ -n ${gpu_name[$gpu_filter]-} ]] || die "GPU index $gpu_filter was not reported by nvidia-smi."
+        printf '%s\n' "$gpu_filter"
+        return
+    fi
+    if (( all_gpus )); then
+        for index in $(printf '%s\n' "${!gpu_name[@]}" | sort -n); do
+            printf '%s\n' "$index"
+        done
+        return
+    fi
+    die 'Choose a target with --gpu INDEX or --all.'
+}
+
+validate_selection() {
+    if [[ -n $gpu_filter ]]; then
+        [[ -n ${gpu_name[$gpu_filter]-} ]] || die "GPU index $gpu_filter was not reported by nvidia-smi."
+    elif (( ! all_gpus )); then
+        die 'Choose a target with --gpu INDEX or --all.'
+    fi
+}
+
+status() {
+    local rows index name bus temp memory_temp power_draw power_limit memory_used memory_total
+    local gpu_clock memory_clock fan pstate settings_gpu core memory vtt memory_pct memory_gib total_gib
+    if [[ -n $gpu_filter ]] && [[ -z ${gpu_name[$gpu_filter]-} ]]; then
+        die "GPU index $gpu_filter was not reported by nvidia-smi."
+    fi
+    rows=$(nvidia-smi \
+        --query-gpu=index,name,pci.bus_id,temperature.gpu,temperature.memory,power.draw,power.limit,memory.used,memory.total,clocks.current.graphics,clocks.current.memory,fan.speed,pstate \
+        --format=csv,noheader,nounits 2>/dev/null) || die 'Unable to read GPU telemetry from nvidia-smi.'
+    [[ -n $rows ]] || die 'No NVIDIA GPUs were reported by nvidia-smi.'
+
+    printf '%sGPUOC v%s%s  NVIDIA control status\n\n' "$cyan" "$gpuoc_version" "$reset"
+    printf '%s%-4s %-25s %7s %7s %11s %15s %5s %6s %11s %5s %4s%s\n' \
+        "$cyan" 'GPU' 'MODEL' 'TEMP' 'MEM T' 'POWER' 'VRAM' 'GCLK' 'MCLK' 'OFFSETS' 'FAN' 'P' "$reset"
+    printf '%s%-4s %-25s %7s %7s %11s %15s %5s %6s %11s %5s %4s%s\n' \
+        "$dim" '----' '-------------------------' '-------' '-------' '-----------' '---------------' '-----' '------' '-----------' '-----' '----' "$reset"
+
+    while IFS=',' read -r index name bus temp memory_temp power_draw power_limit memory_used memory_total gpu_clock memory_clock fan pstate; do
+        index=$(trim "$index")
+        [[ $index =~ ^[0-9]+$ ]] || continue
+        if [[ -n $gpu_filter && $index != "$gpu_filter" ]]; then
+            continue
+        fi
+        name=$(trim "$name")
+        name=${name#NVIDIA }
+        name=${name#GeForce }
+        temp=$(trim "$temp")
+        memory_temp=$(trim "$memory_temp")
+        power_draw=$(trim "$power_draw")
+        power_limit=$(trim "$power_limit")
+        memory_used=$(trim "$memory_used")
+        memory_total=$(trim "$memory_total")
+        gpu_clock=$(trim "$gpu_clock")
+        memory_clock=$(trim "$memory_clock")
+        fan=$(trim "$fan")
+        pstate=$(trim "$pstate")
+        settings_gpu=''
+        core='N/A'
+        memory='N/A'
+        vtt='N/A'
+        if settings_gpu=$(settings_index_for_gpu "$index"); then
+            core=$(query_offset "$settings_gpu" GPUGraphicsClockOffset)
+            memory=$(query_offset "$settings_gpu" GPUMemoryTransferRateOffset)
+            vtt=$(query_vtt_offset "$settings_gpu")
+        fi
+        if is_number "$memory_used" && is_number "$memory_total" && [[ $memory_total != 0 ]]; then
+            memory_pct=$(awk -v used="$memory_used" -v total="$memory_total" 'BEGIN { printf "%.0f%%", used / total * 100 }')
+            memory_gib=$(awk -v used="$memory_used" 'BEGIN { printf "%.1f", used / 1024 }')
+            total_gib=$(awk -v total="$memory_total" 'BEGIN { printf "%.1f", total / 1024 }')
+        else
+            memory_pct='N/A'
+            memory_gib='N/A'
+            total_gib='N/A'
+        fi
+        printf '%-4s %-25.25s %7s %7s %11s %15s %5s %6s %11s %5s %4s\n' \
+            "$index" "$name" "$(fmt_temp "$temp")" "$(fmt_temp "$memory_temp")" \
+            "$(fmt_number "$power_draw")/$(fmt_number "$power_limit")W" \
+            "$memory_gib/$total_gib GB $(fmt_percent "$memory_pct")" \
+            "$(fmt_number "$gpu_clock")" "$(fmt_number "$memory_clock")" \
+            "$(fmt_signed "$core")/$(fmt_signed "$memory")/$(fmt_vtt "$vtt")" "$(fmt_percent "$fan")" "${pstate:-N/A}"
+    done <<< "$rows"
+    printf '\n%sHardware writes are disabled; apply/reset only print commands with --dry-run.%s\n' "$dim" "$reset"
+}
+
+validate_controls() {
+    local absolute
+    if [[ -n $core_offset ]]; then
+        is_integer "$core_offset" || die '--core must be an integer number of MHz.'
+        absolute=$(abs_number "$core_offset")
+        if (( ! unsafe_offsets )) && awk -v value="$absolute" 'BEGIN { exit !(value > 500) }'; then
+            die '--core is capped at +/-500 MHz; add --unsafe to override the conservative cap.'
+        fi
+    fi
+    if [[ -n $memory_offset ]]; then
+        is_integer "$memory_offset" || die '--memory must be an integer number of MHz.'
+        absolute=$(abs_number "$memory_offset")
+        if (( ! unsafe_offsets )) && awk -v value="$absolute" 'BEGIN { exit !(value > 3000) }'; then
+            die '--memory is capped at +/-3000 MHz; add --unsafe to override the conservative cap.'
+        fi
+    fi
+    if [[ -n $power_limit ]]; then
+        is_number "$power_limit" || die '--power-limit must be a number in watts.'
+    fi
+    if [[ -n $fan_speed ]]; then
+        is_integer "$fan_speed" || die '--fan must be an integer percentage.'
+        (( fan_speed >= 20 && fan_speed <= 100 )) || die '--fan must be between 20 and 100 percent.'
+    fi
+    if [[ -n $vtt_offset_mv ]]; then
+        is_integer "$vtt_offset_mv" || die '--vtt must be an integer number of millivolts.'
+        absolute=$(abs_number "$vtt_offset_mv")
+        if (( ! unsafe_offsets )) && awk -v value="$absolute" 'BEGIN { exit !(value > 50) }'; then
+            die '--vtt is capped at +/-50 mV; add --unsafe to override the conservative cap.'
+        fi
+    fi
+}
+
+validate_power_limit() {
+    local index=$1 minimum maximum
+    [[ -n $power_limit ]] || return
+    minimum=${gpu_min_power[$index]-}
+    maximum=${gpu_max_power[$index]-}
+    if is_number "$minimum" && awk -v value="$power_limit" -v minimum="$minimum" 'BEGIN { exit !(value < minimum) }'; then
+        die "GPU $index power limit cannot be below $(fmt_watts "$minimum")."
+    fi
+    if is_number "$maximum" && awk -v value="$power_limit" -v maximum="$maximum" 'BEGIN { exit !(value > maximum) }'; then
+        die "GPU $index power limit cannot exceed $(fmt_watts "$maximum")."
+    fi
+}
+
+confirm_changes() {
+    local scope answer
+    scope=$1
+    (( dry_run )) && return
+    if (( assume_yes )); then
+        return
+    fi
+    [[ -t 0 ]] || die 'Refusing an unconfirmed hardware write on a non-interactive terminal; use --yes.'
+    printf '%sApply GPU settings to %s? [y/N] %s' "$yellow" "$scope" "$reset" >&2
+    read -r answer
+    [[ $answer == y || $answer == Y || $answer == yes || $answer == YES ]] || die 'Cancelled.'
+}
+
+write_setting() {
+    local settings_gpu=$1 attribute=$2 value=$3 output
+    if (( dry_run )); then
+        printf '%sDRY RUN%s nvidia-settings -a [gpu:%s]/%s=%s\n' "$dim" "$reset" "$settings_gpu" "$attribute" "$value"
+        return
+    fi
+    if (( ! hardware_writes_enabled )); then
+        printf 'GPU hardware writes are disabled; refused nvidia-settings write.\n' >&2
+        return 1
+    fi
+    if output=$(nvidia-settings -a "[gpu:${settings_gpu}]/${attribute}=${value}" 2>&1 >/dev/null); then
+        printf '%sApplied%s [gpu:%s]/%s=%s\n' "$green" "$reset" "$settings_gpu" "$attribute" "$value"
+        return
+    fi
+    printf '%sFailed%s [gpu:%s]/%s=%s%s%s\n' "$red" "$reset" "$settings_gpu" "$attribute" "$value" \
+        "${output:+: $output}" "$reset" >&2
+    return 1
+}
+
+write_power_limit() {
+    local index=$1 output
+    if (( dry_run )); then
+        printf '%sDRY RUN%s nvidia-smi -i %s -pl %s\n' "$dim" "$reset" "$index" "$power_limit"
+        return
+    fi
+    if (( ! hardware_writes_enabled )); then
+        printf 'GPU hardware writes are disabled; refused nvidia-smi power-limit write.\n' >&2
+        return 1
+    fi
+    if output=$(nvidia-smi -i "$index" -pl "$power_limit" 2>&1); then
+        printf '%sApplied%s GPU %s power limit=%s\n' "$green" "$reset" "$index" "$(fmt_watts "$power_limit")"
+        return
+    fi
+    printf '%sFailed%s GPU %s power limit=%s%s%s\n' "$red" "$reset" "$index" "$(fmt_watts "$power_limit")" \
+        "${output:+: $output}" "$reset" >&2
+    return 1
+}
+
+apply_gpu() {
+    local index=$1 settings_gpu failures=0
+    validate_power_limit "$index"
+
+    if [[ -n $core_offset || -n $memory_offset || -n $fan_speed || -n $vtt_offset_mv ]]; then
+        command -v nvidia-settings >/dev/null 2>&1 || {
+            printf '%sGPU %s requires nvidia-settings, which is not installed.%s\n' "$red" "$index" "$reset" >&2
+            return 1
+        }
+        if ! settings_gpu=$(settings_index_for_gpu "$index"); then
+            printf '%sGPU %s could not be mapped to an nvidia-settings GPU; check DISPLAY/XAUTHORITY.%s\n' "$red" "$index" "$reset" >&2
+            return 1
+        fi
+    fi
+
+    if [[ -n $core_offset ]]; then
+        write_setting "$settings_gpu" GPUGraphicsClockOffsetAllPerformanceLevels "$core_offset" || ((failures++))
+    fi
+    if [[ -n $memory_offset ]]; then
+        write_setting "$settings_gpu" GPUMemoryTransferRateOffsetAllPerformanceLevels "$memory_offset" || ((failures++))
+    fi
+    if [[ -n $vtt_offset_mv ]]; then
+        write_setting "$settings_gpu" GPUOverVoltageOffset "$((vtt_offset_mv * 1000))" || ((failures++))
+    fi
+    if [[ -n $power_limit ]]; then
+        write_power_limit "$index" || ((failures++))
+    fi
+    if [[ -n $fan_speed ]]; then
+        write_setting "$settings_gpu" GPUFanControlState 1 || ((failures++))
+        write_setting "$settings_gpu" GPUTargetFanSpeed "$fan_speed" || ((failures++))
+    fi
+    return "$failures"
+}
+
+apply() {
+    local index scope failures=0 selected=0
+    [[ -n $core_offset || -n $memory_offset || -n $power_limit || -n $fan_speed || -n $vtt_offset_mv ]] || \
+        die 'apply needs at least one of --core, --memory, --power-limit, --fan, or --vtt.'
+    validate_controls
+    validate_selection
+    require_hardware_writes_enabled
+    while IFS= read -r index; do
+        [[ -n $index ]] || continue
+        validate_power_limit "$index"
+    done < <(selected_gpus)
+
+    if (( all_gpus )); then
+        scope='all GPUs'
+    else
+        scope="GPU $gpu_filter (${gpu_name[$gpu_filter]})"
+    fi
+    confirm_changes "$scope"
+
+    while IFS= read -r index; do
+        [[ -n $index ]] || continue
+        selected=1
+        apply_gpu "$index"
+        failures=$((failures + $?))
+    done < <(selected_gpus)
+    (( selected )) || die 'No target GPUs were selected.'
+    if (( failures > 0 )); then
+        printf '%s%d GPU control operation(s) failed.%s\n' "$red" "$failures" "$reset" >&2
+        return 1
+    fi
+}
+
+reset_gpu() {
+    local index=$1 settings_gpu failures=0 voltage_offset
+    command -v nvidia-settings >/dev/null 2>&1 || {
+        printf '%sGPU %s requires nvidia-settings, which is not installed.%s\n' "$red" "$index" "$reset" >&2
+        return 1
+    }
+    if ! settings_gpu=$(settings_index_for_gpu "$index"); then
+        printf '%sGPU %s could not be mapped to an nvidia-settings GPU; check DISPLAY/XAUTHORITY.%s\n' "$red" "$index" "$reset" >&2
+        return 1
+    fi
+
+    write_setting "$settings_gpu" GPUGraphicsClockOffsetAllPerformanceLevels 0 || ((failures++))
+    write_setting "$settings_gpu" GPUMemoryTransferRateOffsetAllPerformanceLevels 0 || ((failures++))
+    voltage_offset=$(query_setting_value "$settings_gpu" GPUOverVoltageOffset)
+    if is_number "$voltage_offset"; then
+        write_setting "$settings_gpu" GPUOverVoltageOffset 0 || ((failures++))
+    else
+        printf '%sGPU %s does not expose VTT/GPU voltage control; skipped voltage reset.%s\n' "$dim" "$index" "$reset"
+    fi
+    write_setting "$settings_gpu" GPUFanControlState 0 || ((failures++))
+    power_limit=${gpu_default_power[$index]-}
+    if is_number "$power_limit"; then
+        write_power_limit "$index" || ((failures++))
+    else
+        printf '%sGPU %s has no reported default power limit; skipped power reset.%s\n' "$yellow" "$index" "$reset" >&2
+        ((failures++))
+    fi
+    return "$failures"
+}
+
+reset_all() {
+    local index scope failures=0 selected=0
+    validate_selection
+    require_hardware_writes_enabled
+    scope='all GPUs'
+    (( all_gpus )) || scope="GPU $gpu_filter (${gpu_name[$gpu_filter]})"
+    confirm_changes "$scope"
+    while IFS= read -r index; do
+        [[ -n $index ]] || continue
+        selected=1
+        reset_gpu "$index"
+        failures=$((failures + $?))
+    done < <(selected_gpus)
+    (( selected )) || die 'No target GPUs were selected.'
+    if (( failures > 0 )); then
+        printf '%s%d GPU reset operation(s) failed.%s\n' "$red" "$failures" "$reset" >&2
+        return 1
+    fi
+}
+
+command=${1:-status}
+if [[ $command == -h || $command == --help ]]; then
+    usage
+    exit 0
+fi
+if [[ $command == --version ]]; then
+    printf '%s\n' "$gpuoc_version"
+    exit 0
+fi
+if [[ $command != status && $command != apply && $command != reset ]]; then
+    die "Unknown command: $command (try --help)."
+fi
+shift || true
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -g|--gpu)
+            [[ $# -ge 2 ]] || die "${1} requires a GPU index."
+            gpu_filter=$2
+            shift 2
+            ;;
+        --all)
+            all_gpus=1
+            shift
+            ;;
+        --core)
+            [[ $# -ge 2 ]] || die '--core requires an offset in MHz.'
+            core_offset=$2
+            shift 2
+            ;;
+        --memory)
+            [[ $# -ge 2 ]] || die '--memory requires an offset in MHz.'
+            memory_offset=$2
+            shift 2
+            ;;
+        --power-limit)
+            [[ $# -ge 2 ]] || die '--power-limit requires a value in watts.'
+            power_limit=$2
+            shift 2
+            ;;
+        --fan)
+            [[ $# -ge 2 ]] || die '--fan requires a percentage.'
+            fan_speed=$2
+            shift 2
+            ;;
+        --vtt)
+            [[ $# -ge 2 ]] || die '--vtt requires an offset in millivolts.'
+            vtt_offset_mv=$2
+            shift 2
+            ;;
+        --yes)
+            assume_yes=1
+            shift
+            ;;
+        --dry-run)
+            dry_run=1
+            shift
+            ;;
+        --unsafe)
+            unsafe_offsets=1
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        -V|--version)
+            printf '%s\n' "$gpuoc_version"
+            exit 0
+            ;;
+        *)
+            die "Unknown option: $1 (try --help)."
+            ;;
+    esac
+done
+
+if (( all_gpus )) && [[ -n $gpu_filter ]]; then
+    die '--gpu and --all cannot be used together.'
+fi
+if [[ $command == status ]] && { (( all_gpus )) || [[ -n $core_offset || -n $memory_offset || -n $power_limit || -n $fan_speed || -n $vtt_offset_mv ]]; }; then
+    die 'status accepts only --gpu INDEX.'
+fi
+if [[ -n $gpu_filter && ! $gpu_filter =~ ^[0-9]+$ ]]; then
+    die 'GPU index must be a non-negative integer.'
+fi
+
+require_commands
+query_gpu_inventory
+discover_settings_gpus
+
+case $command in
+    status)
+        status
+        ;;
+    apply)
+        [[ -n $gpu_filter || $all_gpus -eq 1 ]] || die 'apply requires --gpu INDEX or --all.'
+        apply
+        ;;
+    reset)
+        [[ -n $gpu_filter || $all_gpus -eq 1 ]] || die 'reset requires --gpu INDEX or --all.'
+        reset_all
+        ;;
+esac
