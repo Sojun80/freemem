@@ -9,13 +9,16 @@ set -u
 LC_ALL=C
 export LC_ALL
 
-gpuwatch_version='1.01'
+gpuwatch_version='1.03'
 interval=1
 gpu_filter=''
 once=0
 positional_refresh_rate=0
+allow_sudo_prompt=1
+original_args=("$@")
 declare -A nvml_core_offsets=()
 declare -A nvml_memory_offsets=()
+hbm_mclk_bin=''
 
 if [[ -t 1 ]]; then
     cyan=$'\033[36m'
@@ -49,12 +52,21 @@ Options:
   -i, --interval SEC       Alias for --refresh-rate
   -g, --gpu INDEX         Show only one nvidia-smi GPU index
   -1, --once              Print one snapshot and exit
+  --no-sudo               Never offer to re-run with sudo for HBM clocks
   -h, --help              Show this help
 
-Displayed values include GPU and memory temperature, power draw and limit,
-VRAM usage, utilization, current/max performance-level graphics and memory
-clocks, fan speed, P-state, and core/memory clock offsets from NVML or
-nvidia-settings when available.
+ Displayed values include GPU and memory temperature, power draw and limit,
+ VRAM usage, utilization, current/max performance-level graphics and memory
+ clocks, fan speed, P-state, and core/memory clock offsets from NVML or
+ nvidia-settings when available.
+
+ On CMP 170HX (HBM), the driver refuses memory offsets and nvidia-smi memory
+ clocks are blind to the live setting: the true HBM clock is NDIV*27 MHz,
+ read via hbm_mclk over BAR0 (needs root). When available, MCLK shows the
+ true clock with its NDIV (for example: 999 MHz [N37]); stock is N64=1728.
+ Without root or hbm_mclk, MCLK falls back to the driver's (possibly stale)
+ value. When run interactively on a 170HX box without root, gpuwatch offers
+ to re-run itself with sudo (--no-sudo disables the offer).
 
 Press Ctrl-C to exit live mode.
 EOF
@@ -95,6 +107,109 @@ gpu_display_name() {
     name=${name#NVIDIA }
     name=${name#GeForce }
     printf '%s' "$name"
+}
+
+is_170hx() {
+    local normalized_device_id=${1-}
+    normalized_device_id=${normalized_device_id,,}
+    normalized_device_id=${normalized_device_id#0x}
+    [[ $normalized_device_id == 20c2* || $normalized_device_id == 2082* ]]
+}
+
+discover_hbm_tool() {
+    hbm_mclk_bin=''
+    if command -v hbm_mclk >/dev/null 2>&1; then
+        hbm_mclk_bin=$(command -v hbm_mclk)
+    elif [[ -x /usr/local/bin/hbm_mclk ]]; then
+        hbm_mclk_bin=/usr/local/bin/hbm_mclk
+    fi
+}
+
+# True HBM clock on CMP 170HX via BAR0 (hbm_mclk). nvidia-smi is blind to a
+# live userspace NDIV write, so without this the MCLK column goes stale.
+# Prints "NDIV\tMHZ" (for example: "37\t999") or nothing when unavailable.
+# Needs root for BAR0 mmap; fails silently otherwise (caller falls back).
+ndiv_for_gpu() {
+    local smi_index=${1-} pci_bus_id=${2-}
+    local out ndiv domain rest dom4 bdf
+
+    [[ -n $hbm_mclk_bin && -x $hbm_mclk_bin ]] || return 1
+
+    # Prefer addressing by BDF (unambiguous physical device). nvidia-smi bus
+    # IDs look like 00000000:01:00.0; sysfs wants 0000:01:00.0 lowercase.
+    if [[ $pci_bus_id =~ ^([0-9A-Fa-f]+):([0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}\.[0-9])$ ]]; then
+        domain=${BASH_REMATCH[1]}
+        rest=${BASH_REMATCH[2]}
+        if dom4=$(printf '%04x' "$((16#$domain))" 2>/dev/null); then
+            bdf=$(printf '%s:%s' "$dom4" "$rest" | tr 'A-F' 'a-f')
+            out=$("$hbm_mclk_bin" -b "$bdf" get 2>/dev/null | grep -oE 'NDIV [0-9]+' | grep -oE '[0-9]+' | head -n 1)
+            if [[ $out =~ ^[0-9]+$ ]]; then
+                printf '%s\t%s\n' "$out" "$((out * 27))"
+                return 0
+            fi
+        fi
+    fi
+
+    # Fallback: positional index (hbm_mclk sorts by BDF, same as nvidia-smi).
+    if [[ $smi_index =~ ^[0-9]+$ ]]; then
+        out=$("$hbm_mclk_bin" -g "$smi_index" get 2>/dev/null | grep -oE 'NDIV [0-9]+' | grep -oE '[0-9]+' | head -n 1)
+        if [[ $out =~ ^[0-9]+$ ]]; then
+            printf '%s\t%s\n' "$out" "$((out * 27))"
+            return 0
+        fi
+    fi
+    return 1
+}
+
+# MCLK field with the live NDIV: "  999 MHz [N37]". Same visual slot as the
+# legacy current/max pair so 170HX rows stay aligned with each other.
+fmt_ndiv_mclk() {
+    local true_mhz=${1-} ndiv=${2-}
+    if [[ $true_mhz =~ ^[0-9]+$ && $ndiv =~ ^[0-9]+$ ]]; then
+        printf '%5s MHz [N%s]' "$true_mhz" "$ndiv"
+    else
+        printf '%s' "${true_mhz:-N/A}"
+    fi
+}
+
+# Offer to re-run under sudo when true HBM clocks need it. Only fires when
+# every one of these holds: non-root, prompting allowed and interactive,
+# sudo exists, hbm_mclk exists, a 170HX is present, and its NDIV is not
+# already readable (a udev rule or setuid could allow BAR0 without root).
+# Called once before the first frame; scripts/pipes never get prompted.
+maybe_escalate_for_hbm() {
+    local rows idx bus did norm answer ndiv_values
+    (( EUID == 0 )) && return 0
+    (( allow_sudo_prompt )) || return 0
+    [[ -t 0 ]] || return 0
+    command -v sudo >/dev/null 2>&1 || return 0
+    [[ -n $hbm_mclk_bin && -x $hbm_mclk_bin ]] || return 0
+
+    rows=$(nvidia-smi --query-gpu=index,pci.bus_id,pci.device_id --format=csv,noheader,nounits 2>/dev/null) || return 0
+    idx=''; bus=''
+    while IFS=',' read -r idx bus did; do
+        idx=$(trim "$idx"); bus=$(trim "$bus"); did=$(trim "$did")
+        norm=${did,,}; norm=${norm#0x}
+        if [[ $norm == 20c2* || $norm == 2082* ]]; then
+            break
+        fi
+        idx=''
+    done <<< "$rows"
+    [[ -n $idx ]] || return 0
+
+    # Already readable without root? Then no escalation needed.
+    if ndiv_values=$(ndiv_for_gpu "$idx" "$bus"); then
+        [[ -n $ndiv_values ]] && return 0
+    fi
+
+    printf '%s170HX detected: true HBM memory clocks need root (BAR0).%s\n' "$yellow" "$reset" >&2
+    printf 'Re-run with sudo for true MCLK/NDIV readings? [y/N] ' >&2
+    answer=''
+    IFS= read -r answer || true
+    if [[ $answer =~ ^[Yy]([Ee][Ss])?$ ]]; then
+        exec sudo -- "$0" "${original_args[@]}"
+    fi
+    printf '(continuing without root: MCLK shows driver-reported values)\n' >&2
 }
 
 fmt_mem() {
@@ -579,6 +694,7 @@ render_snapshot() {
     local current_memory max_memory fan pstate
     local bus_hex bus_decimal offsets clock_values core_offset memory_offset memory_pct
     local settings_current_graphics settings_max_graphics settings_current_memory settings_max_memory
+    local ndiv_values ndiv true_mclk mclk_field
     local rendered=0
 
     rows=$(nvidia-smi --query-gpu=index,name,pci.bus_id,pci.device_id,temperature.gpu,temperature.memory,power.draw,power.limit,memory.used,memory.total,utilization.gpu,utilization.memory,clocks.current.graphics,clocks.max.graphics,clocks.current.memory,clocks.max.memory,fan.speed,pstate --format=csv,noheader,nounits 2>/dev/null) || {
@@ -650,14 +766,27 @@ render_snapshot() {
         [[ $settings_max_memory != N/A ]] && max_memory=$settings_max_memory
         memory_pct=$(memory_percent "$memory_used" "$memory_total")
 
-        printf '%s%-13.13s%s |%s/%s |%s |%s | GCLK %s | M %s/%sGB%s | MEM %s | MCLK %s MHz | FAN %s | Core %4s | Mem %4s | %2s%s\n' \
+        # CMP 170HX: nvidia-smi memory clocks are blind to a live NDIV write,
+        # so prefer the BAR0 truth (NDIV*27 MHz) when hbm_mclk can read it.
+        mclk_field="$(fmt_clock_pair "$current_memory" "$max_memory") MHz"
+        if is_170hx "$pci_device_id"; then
+            ndiv=''; true_mclk=''
+            if ndiv_values=$(ndiv_for_gpu "$index" "$pci_bus_id"); then
+                IFS=$'\t' read -r ndiv true_mclk <<< "$ndiv_values"
+            fi
+            if [[ $ndiv =~ ^[0-9]+$ && $true_mclk =~ ^[0-9]+$ ]]; then
+                mclk_field=$(fmt_ndiv_mclk "$true_mclk" "$ndiv")
+            fi
+        fi
+
+        printf '%s%-13.13s%s |%s/%s |%s |%s | GCLK %s | M %s/%sGB%s | MEM %s | MCLK %s | FAN %s | Core %4s | Mem %4s | %2s%s\n' \
             "$cyan" "$name" "$reset" \
             "$(temp_compact_field "$gpu_temp")" "$(temp_compact_field "$memory_temp" 85 95)" \
             "$(fmt_percent_field "$gpu_util")" "$(fmt_power_pair "$power_draw" "$power_limit")" \
             "$(fmt_clock_pair "$current_graphics" "$max_graphics")" \
             "$(fmt_gib_field "$memory_used")" "$(fmt_gib_field "$memory_total")" \
             "$(capacity_compact_field "$memory_pct")" "$(util_field "$memory_util")" \
-            "$(fmt_clock_pair "$current_memory" "$max_memory")" \
+            "$mclk_field" \
             "$(fan_field "$fan")" "$(fmt_offset_short "$core_offset")" \
             "$(fmt_offset_short "$memory_offset")" "${pstate:-N/A}" "$reset"
         rendered=1
@@ -685,6 +814,10 @@ while [[ $# -gt 0 ]]; do
             once=1
             shift
             ;;
+        --no-sudo)
+            allow_sudo_prompt=0
+            shift
+            ;;
         -h|--help)
             usage
             exit 0
@@ -710,8 +843,10 @@ fi
 command -v nvidia-smi >/dev/null 2>&1 || die 'nvidia-smi is required.'
 
 discover_settings_gpus
+discover_hbm_tool
+maybe_escalate_for_hbm
 
-trap 'printf "%s%s" "$reset" "$show_cursor"; exit 0' INT TERM
+trap 'printf "%s%s\n\n" "$reset" "$show_cursor"; exit 0' INT TERM
 
 while :; do
     # Collect everything before touching the terminal. Offset queries can take
