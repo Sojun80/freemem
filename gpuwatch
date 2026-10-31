@@ -9,7 +9,7 @@ set -u
 LC_ALL=C
 export LC_ALL
 
-gpuwatch_version='1.04'
+gpuwatch_version='2.05'
 interval=1
 gpu_filter=''
 once=0
@@ -75,8 +75,8 @@ Options:
  read via hbm_mclk over BAR0 (needs root). When available, MCLK shows the
  true clock with its NDIV (for example: 999 MHz [N37]); stock is N64=1728.
  Without root or hbm_mclk, MCLK falls back to the driver's (possibly stale)
- value. When run interactively on a 170HX box without root, gpuwatch offers
- to re-run itself with sudo (--no-sudo disables the offer).
+ value. When run interactively on a 170HX box without root, gpuwatch
+ automatically re-runs itself with sudo (--no-sudo disables this behavior).
 
  Live mode reads one long-running nvidia-smi (-lms) instead of starting a new
  one every refresh: on the CMP unlock driver every new nvidia-smi or NVML
@@ -187,13 +187,13 @@ fmt_ndiv_mclk() {
     fi
 }
 
-# Offer to re-run under sudo when true HBM clocks need it. Only fires when
-# every one of these holds: non-root, prompting allowed and interactive,
+# Re-run under sudo when true HBM clocks need it. Only fires when every one of
+# these holds: non-root, prompting allowed and interactive,
 # sudo exists, hbm_mclk exists, a 170HX is present, and its NDIV is not
 # already readable (a udev rule or setuid could allow BAR0 without root).
 # Called once before the first frame; scripts/pipes never get prompted.
 maybe_escalate_for_hbm() {
-    local rows idx bus did norm answer ndiv_values
+    local rows idx bus did norm ndiv_values
     (( EUID == 0 )) && return 0
     (( allow_sudo_prompt )) || return 0
     [[ -t 0 ]] || return 0
@@ -217,14 +217,8 @@ maybe_escalate_for_hbm() {
         [[ -n $ndiv_values ]] && return 0
     fi
 
-    printf '%s170HX detected: true HBM memory clocks need root (BAR0).%s\n' "$yellow" "$reset" >&2
-    printf 'Re-run with sudo for true MCLK/NDIV readings? [y/N] ' >&2
-    answer=''
-    IFS= read -r answer || true
-    if [[ $answer =~ ^[Yy]([Ee][Ss])?$ ]]; then
-        exec sudo -- "$0" "${original_args[@]}"
-    fi
-    printf '(continuing without root: MCLK shows driver-reported values)\n' >&2
+    printf '%s170HX detected: re-running with sudo for true HBM MCLK/NDIV readings.%s\n' "$yellow" "$reset" >&2
+    exec sudo -- "$0" "${original_args[@]}"
 }
 
 fmt_mem() {
