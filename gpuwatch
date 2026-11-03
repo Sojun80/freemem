@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# gpuwatch - live NVIDIA GPU settings and telemetry watcher.
+# gpuwatch - live NVIDIA and AMD GPU settings and telemetry watcher.
 #
 # This intentionally focuses on the GPU itself: temperatures, power, memory,
 # clocks, and driver-exposed overclock settings. It does not list processes.
@@ -9,7 +9,7 @@ set -u
 LC_ALL=C
 export LC_ALL
 
-gpuwatch_version='2.05'
+gpuwatch_version='2.06'
 interval=1
 gpu_filter=''
 once=0
@@ -28,6 +28,7 @@ stream_dir=''
 smi_pid=''
 reader_pid=''
 stream_started_at=0
+gpu_backend=''
 
 if [[ -t 1 ]]; then
     cyan=$'\033[36m'
@@ -51,7 +52,7 @@ usage() {
     cat <<EOF
 Usage: ${0##*/} [REFRESH_RATE] [OPTIONS]
 
-Live NVIDIA GPU settings and telemetry watcher.
+Live NVIDIA and AMD GPU settings and telemetry watcher.
 
 Argument:
   REFRESH_RATE             Refresh rate in seconds (for example: 1, 1.0, .5)
@@ -59,7 +60,7 @@ Argument:
 Options:
   -r, --refresh-rate SEC   Refresh rate in seconds (default: 1)
   -i, --interval SEC       Alias for --refresh-rate
-  -g, --gpu INDEX         Show only one nvidia-smi GPU index
+  -g, --gpu INDEX         Show only one GPU index
   -1, --once              Print one snapshot and exit
   --offsets-every SEC     Re-read the NVML clock offsets every SEC seconds (default: 30)
   --no-sudo               Never offer to re-run with sudo for HBM clocks
@@ -67,8 +68,10 @@ Options:
 
  Displayed values include GPU and memory temperature, power draw and limit,
  VRAM usage, utilization, current/max performance-level graphics and memory
- clocks, fan speed, P-state, and core/memory clock offsets from NVML or
- nvidia-settings when available.
+ clocks, fan speed, P-state, and core/memory clock offsets when the driver
+ exposes them. NVIDIA uses NVML/nvidia-settings; AMD uses amd-smi, with an
+ amdgpu sysfs fallback. AMD offset fields are shown as N/A unless a compatible
+ read-only driver value is available.
 
  On CMP 170HX (HBM), the driver refuses memory offsets and nvidia-smi memory
  clocks are blind to the live setting: the true HBM clock is NDIV*27 MHz,
@@ -78,10 +81,10 @@ Options:
  value. When run interactively on a 170HX box without root, gpuwatch
  automatically re-runs itself with sudo (--no-sudo disables this behavior).
 
- Live mode reads one long-running nvidia-smi (-lms) instead of starting a new
- one every refresh: on the CMP unlock driver every new nvidia-smi or NVML
- session logs 18 kernel lines, which a once-a-second poll turned into gigabytes
- of syslog a day.
+ NVIDIA live mode reads one long-running nvidia-smi (-lms) instead of starting
+ a new one every refresh: on the CMP unlock driver every new nvidia-smi or
+ NVML session logs 18 kernel lines, which a once-a-second poll turned into
+ gigabytes of syslog a day. AMD is polled through amd-smi or amdgpu sysfs.
 
 Press Ctrl-C to exit live mode.
 EOF
@@ -465,6 +468,215 @@ memory_percent() {
     fi
 }
 
+# AMD supplies equivalent read-only telemetry through amd-smi.  Its JSON
+# schema has changed between releases, so the parser deliberately identifies
+# fields by their documented names rather than pinning gpuwatch to one release.
+# Rows use the same tab-separated schema as nvidia-smi above:
+# index, name, BDF, device ID, temperatures, power, VRAM, utilization, clocks,
+# fan, and performance level.  Values unavailable from the installed driver
+# remain N/A instead of being guessed.
+amd_smi_rows() {
+    local metric static rows
+    command -v amd-smi >/dev/null 2>&1 || return 1
+    command -v python3 >/dev/null 2>&1 || return 1
+
+    metric=$(amd-smi metric --json 2>/dev/null) || metric=''
+    static=$(amd-smi static --json 2>/dev/null) || static=''
+    [[ -n $metric || -n $static ]] || return 1
+
+    rows=$(AMD_METRIC_JSON="$metric" AMD_STATIC_JSON="$static" python3 - <<'PY'
+import json
+import os
+import re
+
+def documents():
+    for name in ("AMD_METRIC_JSON", "AMD_STATIC_JSON"):
+        raw = os.environ.get(name, "")
+        if not raw:
+            continue
+        try:
+            yield json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+
+def is_device_key(key):
+    return bool(re.search(r"(?:^|[^a-z])(gpu|card|device)[ _:#-]*[0-9a-f]+(?:$|[^a-z])", str(key).lower()))
+
+def device_maps(value, parent=""):
+    if not isinstance(value, dict):
+        return
+    for key, child in value.items():
+        if isinstance(child, dict):
+            # Current amd-smi emits GPU:0-style keys; some older releases use
+            # a gpu map whose immediate children are numeric IDs.
+            if is_device_key(key) or ("gpu" in str(key).lower() and any(isinstance(v, dict) for v in child.values())):
+                if is_device_key(key):
+                    yield str(key), child
+                else:
+                    for nested_key, nested in child.items():
+                        if isinstance(nested, dict):
+                            yield "GPU:" + str(nested_key), nested
+            yield from device_maps(child, str(key))
+
+def leaves(value, path=""):
+    if isinstance(value, dict):
+        for key, child in value.items():
+            yield from leaves(child, (path + " " + str(key)).strip())
+    elif isinstance(value, list):
+        for child in value:
+            yield from leaves(child, path)
+    else:
+        yield path.lower().replace("-", "_").replace(" ", "_"), value
+
+def text(value):
+    return str(value).strip() if value is not None else ""
+
+def number(value, kind="plain"):
+    raw = text(value)
+    match = re.search(r"[-+]?[0-9]+(?:[.][0-9]+)?", raw)
+    if not match:
+        return "N/A"
+    result = float(match.group(0))
+    lower = raw.lower()
+    if kind == "memory":
+        if "tib" in lower or "tb" in lower:
+            result *= 1024 * 1024
+        elif "gib" in lower or "gb" in lower:
+            result *= 1024
+        elif "kib" in lower or "kb" in lower:
+            result /= 1024
+        elif "byte" in lower or result > 1048576:
+            result /= 1024 * 1024
+    elif kind == "power":
+        if "uw" in lower or "microwatt" in lower:
+            result /= 1000000
+        elif "mw" in lower or "milliwatt" in lower:
+            result /= 1000
+    elif kind == "clock":
+        if "ghz" in lower:
+            result *= 1000
+        elif "khz" in lower:
+            result /= 1000
+        elif "hz" in lower and "mhz" not in lower:
+            result /= 1000000
+    return ("%.3f" % result).rstrip("0").rstrip(".")
+
+def select(flat, aliases, kind="plain"):
+    for alias in aliases:
+        for path, value in flat:
+            if alias in path:
+                parsed = number(value, kind)
+                if parsed != "N/A":
+                    return parsed
+    return "N/A"
+
+def select_text(flat, aliases):
+    for alias in aliases:
+        for path, value in flat:
+            if alias in path and text(value):
+                return text(value)
+    return "N/A"
+
+metric_devices = []
+static_devices = []
+for doc_index, doc in enumerate(documents()):
+    target = metric_devices if doc_index == 0 and os.environ.get("AMD_METRIC_JSON") else static_devices
+    seen = set()
+    for key, device in device_maps(doc):
+        marker = id(device)
+        if marker not in seen:
+            seen.add(marker)
+            target.append((key, list(leaves(device))))
+
+# A one-GPU system can have a top-level map without an explicit GPU label.
+if not metric_devices and os.environ.get("AMD_METRIC_JSON"):
+    try:
+        metric_devices.append(("GPU:0", list(leaves(json.loads(os.environ["AMD_METRIC_JSON"])))) )
+    except json.JSONDecodeError:
+        pass
+
+for index, (key, flat) in enumerate(metric_devices or static_devices):
+    static_flat = static_devices[index][1] if index < len(static_devices) else []
+    all_flat = flat + static_flat
+    gpu_id = select_text(all_flat, ["gpu_id", "gpu_index"])
+    if gpu_id == "N/A":
+        match = re.search(r"([0-9]+)$", key)
+        gpu_id = match.group(1) if match else str(index)
+    name = select_text(all_flat, ["product_name", "market_name", "card_series", "asic_name", "name"])
+    bdf = select_text(all_flat, ["bdf", "pci_bus", "bus_id"])
+    device_id = select_text(all_flat, ["device_id", "pci_device"])
+    edge = select(flat, ["temperature_edge", "edge_temperature", "temp_edge", "edge"], "plain")
+    memory_temp = select(flat, ["temperature_mem", "mem_temperature", "temp_mem", "memory_temperature"], "plain")
+    power = select(flat, ["average_socket_power", "current_socket_power", "power_draw", "power"], "power")
+    power_limit = select(all_flat, ["power_cap", "power_limit", "max_power"], "power")
+    memory_used = select(flat, ["vram_used", "memory_used", "used_vram", "used_memory"], "memory")
+    memory_total = select(all_flat, ["vram_total", "memory_total", "total_vram", "total_memory"], "memory")
+    gpu_util = select(flat, ["gfx_activity", "gpu_usage", "gpu_utilization", "gpu_activity"], "plain")
+    memory_util = select(flat, ["mem_activity", "memory_usage", "memory_utilization"], "plain")
+    gclk = select(flat, ["gfxclk", "gfx_0", "graphics_clock", "gpu_clock"], "clock")
+    gclk_max = select(all_flat, ["max_gfxclk", "max_gpu_clock", "max_graphics_clock"], "clock")
+    mclk = select(flat, ["uclk", "memclk", "memory_clock"], "clock")
+    mclk_max = select(all_flat, ["max_uclk", "max_memclk", "max_memory_clock"], "clock")
+    fan = select(flat, ["fan_speed_percent", "fan_percent", "fan_speed"], "plain")
+    pstate = select_text(flat, ["performance_level", "pstate", "power_profile"])
+    print("\t".join([gpu_id, name, bdf, device_id, edge, memory_temp, power, power_limit,
+                     memory_used, memory_total, gpu_util, memory_util, gclk, gclk_max,
+                     mclk, mclk_max, fan, pstate]))
+PY
+) || return 1
+    [[ -n $rows ]] || return 1
+    printf '%s\n' "$rows"
+}
+
+amd_sysfs_rows() {
+    local device card index vendor name bdf hwmon base gpu_temp memory_temp power power_limit
+    local memory_used memory_total gpu_util current_graphics max_graphics current_memory max_memory fan pstate
+
+    for device in /sys/class/drm/card*/device; do
+        [[ -r $device/vendor ]] || continue
+        vendor=$(<"$device/vendor")
+        [[ ${vendor,,} == 0x1002 ]] || continue
+        card=${device%/device}; card=${card##*/}; index=${card#card}
+        name=$(lspci -s "$(<"$device/uevent" 2>/dev/null | sed -n 's/^PCI_SLOT_NAME=//p')" 2>/dev/null | sed 's/^[^:]*: //')
+        [[ -n $name ]] || name='AMD GPU'
+        bdf=$(sed -n 's/^PCI_SLOT_NAME=//p' "$device/uevent" 2>/dev/null | head -n 1)
+        hwmon=$(find "$device/hwmon" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -n 1)
+        base=${hwmon:-$device}
+        gpu_temp=$(awk '{printf "%.3f", $1 / 1000}' "$base/temp1_input" 2>/dev/null || printf 'N/A')
+        memory_temp=$(awk '{printf "%.3f", $1 / 1000}' "$base/temp2_input" 2>/dev/null || printf 'N/A')
+        power=$(awk '{printf "%.3f", $1 / 1000000}' "$base/power1_average" 2>/dev/null || printf 'N/A')
+        power_limit=$(awk '{printf "%.3f", $1 / 1000000}' "$base/power1_cap" 2>/dev/null || printf 'N/A')
+        memory_used=$(awk '{printf "%.3f", $1 / 1024 / 1024}' "$device/mem_info_vram_used" 2>/dev/null || printf 'N/A')
+        memory_total=$(awk '{printf "%.3f", $1 / 1024 / 1024}' "$device/mem_info_vram_total" 2>/dev/null || printf 'N/A')
+        gpu_util=$(cat "$device/gpu_busy_percent" 2>/dev/null || printf 'N/A')
+        current_graphics=$(awk '/\*/ {for (i = 1; i <= NF; i++) if ($i !~ /:$/ && $i ~ /[0-9]/) {v = $i; gsub(/[^0-9.]/, "", v); if (v != "") {print v; exit}}}' "$device/pp_dpm_sclk" 2>/dev/null || printf 'N/A')
+        max_graphics=$(awk '{for (i = 1; i <= NF; i++) if ($i !~ /:$/ && $i ~ /[0-9]/) {v = $i; gsub(/[^0-9.]/, "", v); if (v != "") last = v}} END {if (last != "") print last}' "$device/pp_dpm_sclk" 2>/dev/null || printf 'N/A')
+        current_memory=$(awk '/\*/ {for (i = 1; i <= NF; i++) if ($i !~ /:$/ && $i ~ /[0-9]/) {v = $i; gsub(/[^0-9.]/, "", v); if (v != "") {print v; exit}}}' "$device/pp_dpm_mclk" 2>/dev/null || printf 'N/A')
+        max_memory=$(awk '{for (i = 1; i <= NF; i++) if ($i !~ /:$/ && $i ~ /[0-9]/) {v = $i; gsub(/[^0-9.]/, "", v); if (v != "") last = v}} END {if (last != "") print last}' "$device/pp_dpm_mclk" 2>/dev/null || printf 'N/A')
+        fan=$(awk 'NR==FNR { max=$1; next } { if (max > 0) printf "%.3f", $1 * 100 / max }' "$base/fan1_max" "$base/fan1_input" 2>/dev/null || printf 'N/A')
+        pstate=$(cat "$device/power_dpm_force_performance_level" 2>/dev/null || printf 'N/A')
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$index" "$name" "$bdf" 'N/A' "$gpu_temp" "$memory_temp" "$power" "$power_limit" \
+            "$memory_used" "$memory_total" "$gpu_util" 'N/A' "$current_graphics" "$max_graphics" \
+            "$current_memory" "$max_memory" "$fan" "$pstate"
+    done
+}
+
+amd_rows() {
+    amd_smi_rows || amd_sysfs_rows
+}
+
+has_amd_gpu() {
+    local device vendor
+    command -v amd-smi >/dev/null 2>&1 && return 0
+    for device in /sys/class/drm/card*/device; do
+        [[ -r $device/vendor ]] || continue
+        vendor=$(<"$device/vendor")
+        [[ ${vendor,,} == 0x1002 ]] && return 0
+    done
+    return 1
+}
+
 nvml_offsets_for_gpus() {
     nvml_core_offsets=()
     nvml_memory_offsets=()
@@ -757,6 +969,45 @@ ensure_stream() {
     start_stream
 }
 
+render_amd_snapshot() {
+    local rows index name pci_bus_id pci_device_id gpu_temp memory_temp power_draw power_limit
+    local memory_used memory_total gpu_util memory_util current_graphics max_graphics
+    local current_memory max_memory fan pstate memory_pct rendered=0
+
+    rows=$(amd_rows) || {
+        printf '%sUnable to read AMD GPU data from amd-smi or amdgpu sysfs.%s\n' "$red" "$reset"
+        return 1
+    }
+    [[ -n $rows ]] || {
+        printf '%sNo AMD GPUs were reported by amd-smi or amdgpu sysfs.%s\n' "$red" "$reset"
+        return 1
+    }
+
+    while IFS=$'\t' read -r index name pci_bus_id pci_device_id gpu_temp memory_temp power_draw power_limit memory_used memory_total gpu_util memory_util current_graphics max_graphics current_memory max_memory fan pstate; do
+        index=$(trim "$index")
+        [[ -z $index ]] && continue
+        [[ -z $gpu_filter || $index == "$gpu_filter" ]] || continue
+        name=$(trim "$name")
+        [[ -n $name && $name != N/A ]] || name='AMD GPU'
+        memory_pct=$(memory_percent "$memory_used" "$memory_total")
+        printf '%s%-13.13s%s |%s/%s |%s |%s | GCLK %s | M %s/%sGB%s | MEM %s | MCLK %s MHz | FAN %s | Core %4s | Mem %4s | %2s%s\n' \
+            "$cyan" "$name" "$reset" \
+            "$(temp_compact_field "$gpu_temp")" "$(temp_compact_field "$memory_temp" 85 95)" \
+            "$(fmt_percent_field "$gpu_util")" "$(fmt_power_pair "$power_draw" "$power_limit")" \
+            "$(fmt_clock_pair "$current_graphics" "$max_graphics")" \
+            "$(fmt_gib_field "$memory_used")" "$(fmt_gib_field "$memory_total")" \
+            "$(capacity_compact_field "$memory_pct")" "$(util_field "$memory_util")" \
+            "$(fmt_clock_pair "$current_memory" "$max_memory")" \
+            "$(fan_field "$fan")" 'N/A' 'N/A' "${pstate:-N/A}" "$reset"
+        rendered=1
+    done <<< "$rows"
+
+    if (( rendered == 0 )); then
+        printf '%sNo matching AMD GPU was found.%s\n' "$red" "$reset"
+        return 1
+    fi
+}
+
 render_snapshot() {
     local rows
     local index name pci_bus_id gpu_temp memory_temp power_draw power_limit
@@ -766,6 +1017,11 @@ render_snapshot() {
     local settings_current_graphics settings_max_graphics settings_current_memory settings_max_memory
     local ndiv_values ndiv true_mclk mclk_field
     local rendered=0
+
+    [[ $gpu_backend == amd ]] && {
+        render_amd_snapshot
+        return
+    }
 
     if (( once == 1 )); then
         rows=$(nvidia-smi --query-gpu="$smi_fields" --format=csv,noheader,nounits 2>/dev/null) || {
@@ -928,16 +1184,24 @@ fi
 if [[ ! $offsets_every =~ ^[0-9]+$ ]] || (( offsets_every < 1 )); then
     die "--offsets-every must be a whole number of seconds, 1 or more."
 fi
-command -v nvidia-smi >/dev/null 2>&1 || die 'nvidia-smi is required.'
+if command -v nvidia-smi >/dev/null 2>&1; then
+    gpu_backend=nvidia
+elif has_amd_gpu; then
+    gpu_backend=amd
+else
+    die 'No supported GPU telemetry source found (need nvidia-smi, amd-smi, or an AMDGPU sysfs device).'
+fi
 
-discover_settings_gpus
-discover_hbm_tool
-maybe_escalate_for_hbm
+if [[ $gpu_backend == nvidia ]]; then
+    discover_settings_gpus
+    discover_hbm_tool
+    maybe_escalate_for_hbm
+fi
 
 trap 'stop_stream; printf "%s%s\n\n" "$reset" "$show_cursor"; exit 0' INT TERM
 trap 'stop_stream' EXIT
 
-if (( once == 0 )); then
+if [[ $gpu_backend == nvidia && $once == 0 ]]; then
     start_stream
     # the first set of rows, so the first frame is not "waiting" (at most ~3 s)
     for _ in $(seq 1 30); do
@@ -947,10 +1211,10 @@ if (( once == 0 )); then
 fi
 
 while :; do
-    (( once == 0 )) && ensure_stream
+    [[ $gpu_backend == nvidia && $once == 0 ]] && ensure_stream
     # The clock offsets change only when an overclock is applied: re-read them every offsets_every seconds, not
     # every frame (each read is a new NVML session).
-    if [[ -z $offsets_at ]] || (( SECONDS - offsets_at >= offsets_every )); then
+    if [[ $gpu_backend == nvidia ]] && { [[ -z $offsets_at ]] || (( SECONDS - offsets_at >= offsets_every )); }; then
         nvml_offsets_for_gpus
         offsets_at=$SECONDS
     fi

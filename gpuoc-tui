@@ -9,13 +9,17 @@ set -u
 LC_ALL=C
 export LC_ALL
 
-gpuoc_tui_version='0.5.0'
+gpuoc_tui_version='0.6.0'
 refresh_interval='1'
 dry_run=0
+theme='matrix'
+theme_from_cli=0
 
 cyan=$'\033[36m'
 green=$'\033[32m'
+bright_green=$'\033[92m'
 yellow=$'\033[33m'
+bright_yellow=$'\033[93m'
 red=$'\033[31m'
 magenta=$'\033[35m'
 dim=$'\033[2m'
@@ -25,6 +29,48 @@ black=$'\033[30m'
 bg_green=$'\033[42m'
 bg_yellow=$'\033[43m'
 bg_cyan=$'\033[46m'
+
+configure_theme() {
+    case $theme in
+        matrix)
+            cyan=$'\033[36m'; green=$'\033[32m'; bright_green=$'\033[92m'
+            yellow=$'\033[33m'; bright_yellow=$'\033[93m'; red=$'\033[31m'; magenta=$'\033[35m'
+            dim=$'\033[2m'; bold=$'\033[1m'; reset=$'\033[0m'
+            black=$'\033[30m'; bg_green=$'\033[42m'; bg_yellow=$'\033[43m'; bg_cyan=$'\033[46m'
+            ;;
+        amber)
+            cyan=$'\033[38;5;172m'; green=$'\033[38;5;166m'; bright_green=$'\033[38;5;208m'
+            yellow=$'\033[38;5;208m'; bright_yellow=$'\033[38;5;202m'; red=$'\033[38;5;202m'
+            magenta=$'\033[38;5;166m'; dim=$'\033[38;5;130m'
+            bg_green=$'\033[48;5;166m'; bg_yellow=$'\033[48;5;208m'; bg_cyan=$'\033[48;5;172m'
+            reset=$'\033[0m\033[38;5;172m\033[40m'
+            ;;
+        *) die "Unknown theme: $theme (use matrix or amber)." ;;
+    esac
+    notice_color=$dim
+}
+
+theme_preference_path() { printf '%s/gpuoc-tui/theme' "${XDG_CONFIG_HOME:-$HOME/.config}"; }
+
+load_theme() {
+    local saved file
+    file=$(theme_preference_path)
+    [[ -r $file ]] || return 0
+    IFS= read -r saved < "$file" || return 0
+    [[ $saved == matrix || $saved == amber ]] && theme=$saved
+}
+
+set_theme() {
+    local next=$1 file dir
+    theme=$next
+    configure_theme
+    file=$(theme_preference_path); dir=${file%/*}
+    if mkdir -p "$dir" 2>/dev/null && printf '%s\n' "$theme" > "${file}.tmp" && mv -f "${file}.tmp" "$file"; then
+        set_notice "Theme set to ${theme} and saved." "$yellow"
+    else
+        set_notice "Theme set to ${theme}, but could not save ${file}." "$red"
+    fi
+}
 
 selected_gpu=0
 selected_field=0
@@ -60,20 +106,25 @@ declare -A simulated_memory=()
 declare -A simulated_vtt=()
 declare -A simulated_power=()
 declare -A simulated_fan=()
+declare -A simulated_memlock=()
 declare -A target_core=()
 declare -A target_memory=()
 declare -A target_vtt=()
 declare -A target_power=()
 declare -A target_fan=()
+declare -A target_memlock=()
 declare -A dirty_core=()
 declare -A dirty_memory=()
 declare -A dirty_vtt=()
 declare -A dirty_power=()
 declare -A dirty_fan=()
+declare -A dirty_memlock=()
 declare -A settings_gpu_by_bus=()
 declare -A memspd_min=()
 declare -A memspd_max=()
 declare -A memspd_probed=()
+declare -A memspd_options=()
+declare -A memspd_choices=()
 declare -A memlock_speed=()
 
 usage() {
@@ -84,15 +135,18 @@ Keyboard-driven NVIDIA GPU overclocking prototype.
 
 Options:
   -r, --refresh SEC   Telemetry refresh interval (default: 1)
+      --theme NAME    Color theme: matrix (default) or amber
       --dry-run       Preview Apply/Reset without committing simulated values
   -h, --help          Show this help
 
 Keys:
+  F1                 Matrix green theme (saved)
+  F2                 Amber theme (saved)
   GPU list: Up/Down, k/j select a GPU; telemetry + targets stay visible below
             Enter locks that GPU and activates the settings
-            R stages stock targets for ALL GPUs
-  Settings: Up/Down, k/j select Core, Memory, Power, Fan, Core Offset(VTT),
-            Apply, Reset
+            Settings stay read-only until Enter
+  Settings: Up/Down, k/j select Core, Memory offset, Power, Fan,
+            Core Offset(VTT), Memory Lock, Apply, Reset
             Left/Right changes the target by its displayed step
             Each row shows cur, tgt, (delta), [limits], plus a slider below
             it: X = staged target, S = stock/default, * = on default
@@ -102,23 +156,25 @@ Keys:
             r stock-resets the selected row; R stages stock for all GPUs
             s saves the applied setup (refuses while changes are staged);
             l loads the save as new staged targets (asks before replacing)
-            Enter on [Apply] commits; Enter on [Full Reset] stocks + commits
+            Enter on [Apply] commits; Enter on [Reset] stages stock targets
             (a is a keyboard shortcut for Apply)
+            F5 Apply; F6 stage Reset; F7 Save; F8 Load; Tab switches GPU
             Esc returns to the GPU list; q quits; Ctrl+C quits immediately
   Esc with pending changes offers apply, discard, or cancel
   ?                  Show the key reference
 
-Simulation mode only: target edits stay staged until [Apply]/[Full Reset].
-Both update simulated UI values and never write settings to the GPU.
+Simulation mode only: target edits and Reset stay staged until [Apply].
+Apply updates simulated UI values and never writes settings to the GPU.
 Limits are per-model (e.g. 3070 vs 5070); run with --help for details.
 
-Memory locks: when a GPU's memory clock is locked (nvidia-smi -lmc),
-offsets do nothing, so the MEMORY row shows LOCKED and its slider,
-numeric entry, and reset are disabled. Lock speeds come from live
-SUPPORTED_CLOCKS with a built-in 30/40/50-series reference table as
-fallback. Lock state is read from gpuoc's state dir, the driver's
-Deferred Clocks, or GPUOC_SIM_MEMLOCK="idx:speed,..." for UI testing
-(no NVML/driver getter exists for active locks set elsewhere).
+Memory Lock stages DEFAULT (0, unlocked) or a fixed clock in MHz.
+DEFAULT uses the normal full-speed clock range and permits a MEMORY offset.
+On 50-series GPUs, the fixed choice is 810 MHz. On 30/40-series GPUs,
+the choices are supported points among 810, 5000, 5001 and 6000 MHz.
+Use Left/Right to choose a clock, or Enter to type one exactly.
+Selecting a fixed clock disables the MEMORY offset target. Apply updates
+the simulation only. Physical lock state may be read from gpuoc's state dir,
+the driver's Deferred Clocks, or GPUOC_SIM_MEMLOCK="idx:speed,..." for UI testing.
 EOF
 }
 
@@ -232,11 +288,12 @@ set_notice() {
 # Live terminal size: $TERM_W tracks the real width (startup probe + SIGWINCH
 # trap) so borders and sliders follow resizes instead of going stale.
 TERM_W=80
+TERM_H=24
 update_term_size() {
     local sz rows cols
     sz=$(stty size 2>/dev/null) || return 0
     rows=${sz%% *}; cols=${sz##* }
-    is_number "$rows" && (( rows > 0 )) && LINES=$rows
+    is_number "$rows" && (( rows > 0 )) && { LINES=$rows; TERM_H=$rows; }
     if is_number "$cols" && (( cols > 0 )); then COLUMNS=$cols; TERM_W=$cols; fi
     (( TERM_W < 40 )) && TERM_W=40
     (( TERM_W > 100 )) && TERM_W=100
@@ -273,13 +330,13 @@ sane_caps_for_model() {
     case "$upper" in
         *'CMP 170HX'*|*'CMP170HX'*) printf '250:200:0:0'; return ;;
         *'CMP 90HX'*|*'CMP 50HX'*|*'CMP 40HX'*|*'CMP 30HX'*) printf '320:200:800:0'; return ;;
-        *'5090'*) printf '575:300:1500:50'; return ;;
+        *'5090'*) printf '575:300:2000:50'; return ;;
         *'5080'*) printf '360:400:2000:50'; return ;;
         *'5070 TI'*) printf '300:400:2000:50'; return ;;
         *'5070'*) printf '250:400:2000:50'; return ;;
         *'5060 TI'*) printf '180:350:2000:50'; return ;;
         *'5060'*) printf '145:350:2000:50'; return ;;
-        *'5050'*) printf '130:350:1500:50'; return ;;
+        *'5050'*) printf '130:350:2000:50'; return ;;
         *'4090'*) printf '450:250:1200:50'; return ;;
         *'4080 SUPER'*|*'4080S'*) printf '320:250:1200:50'; return ;;
         *'4080'*) printf '320:250:1200:50'; return ;;
@@ -452,6 +509,28 @@ memspeeds_for_model() {
     esac
 }
 
+# The mode picker is deliberately smaller than the driver's full clock list.
+# DEFAULT (0) leaves memory unlocked so its offset remains usable. Fixed
+# speeds are offered only when the driver (or exact fallback endpoint) reports
+# them for this GPU; adjacent models do not necessarily share every point.
+memlock_choices_for_model() {
+    local model=${1^^} reported=$2 allowed speed candidate result=''
+    case $model in
+        *'RTX 50'[1-9][0-9]*) allowed='810' ;;
+        *'RTX 30'[1-9][0-9]*|*'RTX 40'[1-9][0-9]*) allowed='810 5000 5001 6000' ;;
+        *) printf '%s' "$reported"; return ;;
+    esac
+    for candidate in $allowed; do
+        for speed in $reported; do
+            if [[ $speed == "$candidate" ]]; then
+                result+=" ${candidate}"
+                break
+            fi
+        done
+    done
+    printf '%s' "${result# }"
+}
+
 memlock_state_file() {
     printf '%s/gpuoc/memlock' "${XDG_CACHE_HOME:-$HOME/.cache}"
 }
@@ -460,29 +539,40 @@ memlock_state_file() {
 # memory-lock state (state file, deferred-clocks probe, sim override).
 # Startup slow-path only; results cached in memspd_*/memlock_speed assocs.
 probe_mem_speeds() {
-    local index speeds line num lo hi
+    local index speeds line num lo hi options
     for index in "${gpu_indices[@]}"; do
         [[ -n ${memspd_probed[$index]-} ]] && continue
-        lo=''; hi=''
+        lo=''; hi=''; options=''
         if speeds=$(nvidia-smi --query-supported-clocks=memory --format=csv,noheader -i "$index" 2>/dev/null) && [[ -n $speeds ]]; then
             while IFS= read -r line; do
                 num=${line//[^0-9]/}
                 [[ -n $num ]] || continue
                 if [[ -z $lo || $num -lt $lo ]]; then lo=$num; fi
                 if [[ -z $hi || $num -gt $hi ]]; then hi=$num; fi
+                options+=" $num"
             done <<< "$speeds"
         fi
         if [[ -z $lo || -z $hi ]]; then
             speeds=$(memspeeds_for_model "${gpu_name[$index]-}")
             if [[ $speeds == *:* ]]; then
                 lo=${speeds%%:*}; hi=${speeds##*:}
+                options=" $lo $hi"
+                # 810 MHz is an explicit 30/40/50-series choice even when
+                # the driver cannot return its supported-clock list.
+                case ${gpu_name[$index]^^} in
+                    *'RTX 30'[1-9][0-9]*|*'RTX 40'[1-9][0-9]*|*'RTX 50'[1-9][0-9]*)
+                        if (( lo <= 810 && hi >= 810 )); then options+=' 810'; fi
+                        ;;
+                esac
             fi
         fi
         if is_number "$lo" && is_number "$hi" && (( hi > 0 )); then
             memspd_min[$index]=$lo
             memspd_max[$index]=$hi
+            memspd_options[$index]=$(for num in $options; do printf '%s\n' "$num"; done | sort -n -u | paste -sd' ' -)
+            memspd_choices[$index]=$(memlock_choices_for_model "${gpu_name[$index]-}" "${memspd_options[$index]}")
         else
-            unset "memspd_min[$index]" "memspd_max[$index]"
+            unset "memspd_min[$index]" "memspd_max[$index]" "memspd_options[$index]" "memspd_choices[$index]"
         fi
         memspd_probed[$index]=1
     done
@@ -532,6 +622,11 @@ probe_mem_locks() {
             memlock_speed[$espec]=$num
         done
     fi
+    for index in "${gpu_indices[@]}"; do
+        if [[ -z ${dirty_memlock[$index]+set} ]]; then
+            target_memlock[$index]=$(effective_memlock "$index")
+        fi
+    done
 }
 
 memspeeds_pending() {
@@ -708,8 +803,9 @@ refresh_telemetry() {
         [[ -n ${seen[$old_index]-} ]] || {
             unset "gpu_name[$old_index]" "gpu_bus[$old_index]" "gpu_power_default[$old_index]" "current_core[$old_index]" "current_memory[$old_index]" "current_vtt[$old_index]"
             unset "simulated_core[$old_index]" "simulated_memory[$old_index]" "simulated_vtt[$old_index]" "simulated_power[$old_index]" "simulated_fan[$old_index]"
-            unset "target_core[$old_index]" "target_memory[$old_index]" "target_vtt[$old_index]" "target_power[$old_index]" "target_fan[$old_index]"
-            unset "dirty_core[$old_index]" "dirty_memory[$old_index]" "dirty_vtt[$old_index]" "dirty_power[$old_index]" "dirty_fan[$old_index]"
+            unset "simulated_memlock[$old_index]" "memlock_speed[$old_index]" "memspd_min[$old_index]" "memspd_max[$old_index]" "memspd_options[$old_index]" "memspd_choices[$old_index]" "memspd_probed[$old_index]"
+            unset "target_core[$old_index]" "target_memory[$old_index]" "target_vtt[$old_index]" "target_power[$old_index]" "target_fan[$old_index]" "target_memlock[$old_index]"
+            unset "dirty_core[$old_index]" "dirty_memory[$old_index]" "dirty_vtt[$old_index]" "dirty_power[$old_index]" "dirty_fan[$old_index]" "dirty_memlock[$old_index]"
         }
     done
 
@@ -772,8 +868,9 @@ field_name() {
         2) printf 'POWER' ;;
         3) printf 'FAN' ;;
         4) printf 'Core Offset(VTT)' ;;
-        5) printf 'APPLY' ;;
-        6) printf 'RESET' ;;
+        5) printf 'MEM LOCK' ;;
+        6) printf 'APPLY' ;;
+        7) printf 'RESET' ;;
     esac
 }
 
@@ -800,14 +897,23 @@ field_delta_value() {
 
 FDD='-'
 field_delta_display() {
-    local index=$1 field=$2 delta unit
-    if (( field == 1 )) && memlocked "$index"; then FDD='-'; printf '-'; return; fi
+    local index=$1 field=$2 delta unit current target
+    if (( field == 1 )); then
+        if memory_offset_target_locked "$index"; then FDD='-'; printf '-'; return; fi
+        if memlocked "$index"; then FDD='on unlock'; printf '%s' "$FDD"; return; fi
+    fi
+    if (( field == 5 )); then
+        current=$(effective_memlock "$index")
+        target=${target_memlock[$index]-0}
+        if [[ $current == "$target" ]]; then FDD='-'; else FDD="$(memlock_label "$current")->$(memlock_label "$target")"; fi
+        printf '%s' "$FDD"
+        return
+    fi
     case $field in
         0|1) unit='MHz' ;;
         2) unit='W' ;;
         4) unit='mV' ;;
         3)
-            local current target
             effective_current_value "$index" 3 >/dev/null; current=$ECV
             target=${target_fan[$index]-}
             if [[ -z $target && $current == 0 ]]; then FDD='-'; printf '-'; return; fi
@@ -834,7 +940,34 @@ field_delta_display() {
 }
 
 memlocked() {
-    [[ -n ${memlock_speed[$1]-} ]]
+    [[ $(effective_memlock "$1") != 0 ]]
+}
+
+effective_memlock() {
+    local index=$1
+    if [[ ${simulated_memlock[$index]+set} ]]; then
+        printf '%s' "${simulated_memlock[$index]}"
+    else
+        printf '%s' "${memlock_speed[$index]-0}"
+    fi
+}
+
+memlock_supported() {
+    local index=$1 value=$2 speed
+    [[ $value == 0 ]] && return 0
+    for speed in ${memspd_choices[$index]-}; do
+        [[ $speed == "$value" ]] && return 0
+    done
+    return 1
+}
+
+memlock_label() {
+    local value=$1
+    if [[ $value == 0 ]]; then printf 'DEFAULT'; else printf '%s MHz' "$value"; fi
+}
+
+memory_offset_target_locked() {
+    [[ ${target_memlock[$1]-0} != 0 ]]
 }
 
 FCD=''
@@ -844,7 +977,7 @@ field_current_display() {
         0) effective_current_value "$index" 0 >/dev/null; fmt_offset "$ECV" >/dev/null; FCD=$FMT ;;
         1)
             if memlocked "$index"; then
-                FCD="${memlock_speed[$index]} MHz"
+                FCD='DISABLED'
             else
                 effective_current_value "$index" 1 >/dev/null; fmt_offset "$ECV" >/dev/null; FCD=$FMT
             fi
@@ -859,6 +992,7 @@ field_current_display() {
             fi
             ;;
         4) effective_current_value "$index" 4 >/dev/null; fmt_vtt "$ECV" >/dev/null; FCD=$FMT ;;
+        5) FCD=$(memlock_label "$(effective_memlock "$index")") ;;
     esac
     printf '%s' "$FCD"
 }
@@ -869,8 +1003,8 @@ field_target_display() {
     case $field in
         0) fmt_offset "${target_core[$index]-N/A}" >/dev/null; FTD=$FMT ;;
         1)
-            if memlocked "$index"; then
-                FTD='LOCKED'
+            if memory_offset_target_locked "$index"; then
+                FTD='DISABLED'
             else
                 fmt_offset "${target_memory[$index]-N/A}" >/dev/null; FTD=$FMT
             fi
@@ -885,15 +1019,15 @@ field_target_display() {
             fi
             ;;
         4) fmt_vtt "${target_vtt[$index]-N/A}" >/dev/null; FTD=$FMT ;;
+        5) FTD=$(memlock_label "${target_memlock[$index]-0}") ;;
     esac
     printf '%s' "$FTD"
 }
 
 field_is_pending() {
     local index=$1 field=$2 current target
-    # A memory-clock lock pins the hardware: offsets are not applied, so a
-    # locked MEMORY row can never be pending.
-    if (( field == 1 )) && memlocked "$index"; then return 1; fi
+    # A fixed target clock makes the offset irrelevant even before Apply.
+    if (( field == 1 )) && memory_offset_target_locked "$index"; then return 1; fi
     case $field in
         0)
             effective_current_value "$index" 0 >/dev/null; current=$ECV
@@ -921,6 +1055,10 @@ field_is_pending() {
             effective_current_value "$index" 4 >/dev/null; current=$ECV
             target=${target_vtt[$index]-N/A}
             ;;
+        5)
+            current=$(effective_memlock "$index")
+            target=${target_memlock[$index]-0}
+            ;;
     esac
     [[ $current != "$target" && $target != N/A ]]
 }
@@ -928,7 +1066,7 @@ field_is_pending() {
 PC=0
 pending_count() {
     local index=$1 field count=0
-    for field in 0 1 2 3 4; do
+    for field in 0 1 2 3 4 5; do
         field_is_pending "$index" "$field" && ((count++))
     done
     PC=$count
@@ -936,7 +1074,7 @@ pending_count() {
 }
 
 adjust_selected() {
-    local index field=$selected_field delta=$1 value minimum maximum cap
+    local index field=$selected_field delta=$1 value minimum maximum cap speed next
     index=$(selected_gpu_id)
     [[ -n $index ]] || return
 
@@ -953,8 +1091,8 @@ adjust_selected() {
             dirty_core[$index]=1
             ;;
         1)
-            if memlocked "$index"; then
-                set_notice "MEMORY locked at ${memlock_speed[$index]} MHz: offset slider disabled." "$yellow"
+            if memory_offset_target_locked "$index"; then
+                set_notice "MEMORY offset disabled by the fixed $(memlock_label "${target_memlock[$index]}") target." "$yellow"
                 return
             fi
             value=${target_memory[$index]-}
@@ -1017,6 +1155,26 @@ adjust_selected() {
             target_vtt[$index]=$value
             dirty_vtt[$index]=1
             ;;
+        5)
+            [[ -n ${memspd_choices[$index]-} ]] || { set_notice 'Fixed memory clock choices are unavailable for this GPU.' "$yellow"; return; }
+            value=${target_memlock[$index]-0}
+            next=$value
+            if (( delta > 0 )); then
+                for speed in ${memspd_choices[$index]}; do
+                    if (( speed > value )); then next=$speed; break; fi
+                done
+            else
+                next=0
+                for speed in ${memspd_choices[$index]}; do
+                    (( speed < value )) && next=$speed
+                done
+            fi
+            target_memlock[$index]=$next
+            if (( next > 0 )); then
+                target_memory[$index]=$(effective_current_value "$index" 1)
+                unset "dirty_memory[$index]"
+            fi
+            ;;
     esac
     case $field in
         0) field_is_pending "$index" 0 && dirty_core[$index]=1 || unset "dirty_core[$index]" ;;
@@ -1024,6 +1182,7 @@ adjust_selected() {
         2) field_is_pending "$index" 2 && dirty_power[$index]=1 || unset "dirty_power[$index]" ;;
         3) field_is_pending "$index" 3 && dirty_fan[$index]=1 || unset "dirty_fan[$index]" ;;
         4) field_is_pending "$index" 4 && dirty_vtt[$index]=1 || unset "dirty_vtt[$index]" ;;
+        5) field_is_pending "$index" 5 && dirty_memlock[$index]=1 || unset "dirty_memlock[$index]" ;;
     esac
     set_notice "Pending $(field_name): $(field_target_display "$index" "$field") ($(field_delta_display "$index" "$field"))" "$yellow"
 }
@@ -1031,8 +1190,8 @@ adjust_selected() {
 begin_numeric_entry() {
     local index value
     index=$(selected_gpu_id)
-    if (( selected_field == 1 )) && memlocked "$index"; then
-        set_notice "MEMORY locked at ${memlock_speed[$index]} MHz: offset slider disabled." "$yellow"
+    if (( selected_field == 1 )) && memory_offset_target_locked "$index"; then
+        set_notice "MEMORY offset disabled by the fixed $(memlock_label "${target_memlock[$index]}") target." "$yellow"
         return
     fi
     case $selected_field in
@@ -1041,6 +1200,7 @@ begin_numeric_entry() {
         2) value=${target_power[$index]-N/A} ;;
         3) value=${target_fan[$index]-} ;;
         4) value=${target_vtt[$index]-N/A} ;;
+        5) value=${target_memlock[$index]-0} ;;
     esac
     if [[ $selected_field != 3 ]] && ! is_number "$value"; then
         set_notice "$(field_name) is unavailable on this GPU." "$yellow"
@@ -1071,7 +1231,7 @@ commit_numeric_entry() {
             target_core[$index]=$number
             ;;
         1)
-            if memlocked "$index"; then set_notice "MEMORY locked at ${memlock_speed[$index]} MHz: offset slider disabled." "$yellow"; return 1; fi
+            if memory_offset_target_locked "$index"; then set_notice "MEMORY offset disabled by the fixed $(memlock_label "${target_memlock[$index]}") target." "$yellow"; return 1; fi
             cap=$(sane_mem_max "$index"); is_number "$cap" || cap=3000
             if (( cap == 0 )); then set_notice "Memory OC is locked on ${gpu_name[$index]}." "$yellow"; return 1; fi
             (( number >= -cap && number <= cap )) || { set_notice "Memory target must be between -$cap and +$cap MHz for ${gpu_name[$index]}." "$yellow"; return 1; }
@@ -1101,6 +1261,17 @@ commit_numeric_entry() {
             (( number >= -cap && number <= cap )) || { set_notice "VTT target must be between -$cap and +$cap mV." "$yellow"; return 1; }
             target_vtt[$index]=$number
             ;;
+        5)
+            if ! memlock_supported "$index" "$number"; then
+                set_notice "${number} MHz is not an available fixed clock choice for ${gpu_name[$index]}." "$yellow"
+                return 1
+            fi
+            target_memlock[$index]=$number
+            if (( number > 0 )); then
+                target_memory[$index]=$(effective_current_value "$index" 1)
+                unset "dirty_memory[$index]"
+            fi
+            ;;
     esac
 
     case $field in
@@ -1109,6 +1280,7 @@ commit_numeric_entry() {
         2) field_is_pending "$index" 2 && dirty_power[$index]=1 || unset "dirty_power[$index]" ;;
         3) field_is_pending "$index" 3 && dirty_fan[$index]=1 || unset "dirty_fan[$index]" ;;
         4) field_is_pending "$index" 4 && dirty_vtt[$index]=1 || unset "dirty_vtt[$index]" ;;
+        5) field_is_pending "$index" 5 && dirty_memlock[$index]=1 || unset "dirty_memlock[$index]" ;;
     esac
     numeric_entry=0
     numeric_buffer=''
@@ -1117,7 +1289,7 @@ commit_numeric_entry() {
 }
 
 adjust_numeric_entry() {
-    local delta=$1 index=$active_gpu base step minimum maximum
+    local delta=$1 index=$active_gpu base step minimum maximum speed next
     if [[ $numeric_buffer =~ ^-?[0-9]+$ ]]; then
         base=$((10#${numeric_buffer#-}))
         [[ $numeric_buffer == -* ]] && base=$((-base))
@@ -1128,7 +1300,28 @@ adjust_numeric_entry() {
             2) base=${target_power[$index]-N/A} ;;
             3) base=${target_fan[$index]-} ;;
             4) base=${target_vtt[$index]-N/A} ;;
+            5) base=${target_memlock[$index]-0} ;;
         esac
+    fi
+
+    if (( selected_field == 5 )); then
+        [[ -n ${memspd_choices[$index]-} ]] || { set_notice 'Fixed memory clock choices are unavailable for this GPU.' "$yellow"; return; }
+        is_number "$base" || base=0
+        next=$base
+        if (( delta > 0 )); then
+            for speed in ${memspd_choices[$index]}; do
+                if (( speed > base )); then next=$speed; break; fi
+            done
+        else
+            next=0
+            for speed in ${memspd_choices[$index]}; do
+                (( speed < base )) && next=$speed
+            done
+        fi
+        numeric_buffer=$next
+        numeric_replaced=0
+        set_notice "Exact MEM LOCK value: $(memlock_label "$next"); Enter accepts." "$yellow"
+        return
     fi
 
     case $selected_field in
@@ -1164,6 +1357,9 @@ adjust_numeric_entry() {
             minimum=-$(sane_vtt_max "$index"); maximum=$(sane_vtt_max "$index")
             is_number "$minimum" || minimum=-50
             is_number "$maximum" || maximum=50
+            ;;
+        5)
+            step=405; minimum=0; maximum=${memspd_max[$index]-0}
             ;;
     esac
 
@@ -1217,7 +1413,7 @@ discard_selected() {
     local index field=$selected_field
     index=$(selected_gpu_id)
     [[ -n $index ]] || return
-    if (( field >= 5 )); then
+    if (( field >= 6 )); then
         set_notice 'Select a setting row to discard its target.' "$dim"
         return
     fi
@@ -1230,6 +1426,7 @@ discard_selected() {
             unset "dirty_fan[$index]"
             ;;
         4) target_vtt[$index]=$(effective_current_value "$index" 4); unset "dirty_vtt[$index]" ;;
+        5) target_memlock[$index]=$(effective_memlock "$index"); unset "dirty_memlock[$index]" ;;
     esac
     set_notice "Discarded $(field_name) change." "$dim"
 }
@@ -1241,7 +1438,8 @@ discard_all_pending() {
     target_power[$index]=$(effective_current_value "$index" 2)
     target_vtt[$index]=$(effective_current_value "$index" 4)
     target_fan[$index]=$(effective_fan_target "$index")
-    unset "dirty_core[$index]" "dirty_memory[$index]" "dirty_vtt[$index]" "dirty_power[$index]" "dirty_fan[$index]"
+    target_memlock[$index]=$(effective_memlock "$index")
+    unset "dirty_core[$index]" "dirty_memory[$index]" "dirty_vtt[$index]" "dirty_power[$index]" "dirty_fan[$index]" "dirty_memlock[$index]"
 }
 
 choose_unsaved_action() {
@@ -1324,7 +1522,8 @@ apply_pending() {
     field_is_pending "$index" 2 && simulated_power[$index]=${target_power[$index]}
     field_is_pending "$index" 3 && simulated_fan[$index]=${target_fan[$index]}
     field_is_pending "$index" 4 && simulated_vtt[$index]=${target_vtt[$index]}
-    unset "dirty_core[$index]" "dirty_memory[$index]" "dirty_vtt[$index]" "dirty_power[$index]" "dirty_fan[$index]"
+    field_is_pending "$index" 5 && simulated_memlock[$index]=${target_memlock[$index]}
+    unset "dirty_core[$index]" "dirty_memory[$index]" "dirty_vtt[$index]" "dirty_power[$index]" "dirty_fan[$index]" "dirty_memlock[$index]"
     refresh_telemetry >/dev/null || true
     # Rebase non-dirty targets on the new simulated-applied values (no slow queries).
     if [[ -z ${dirty_core[$index]+set} ]]; then target_core[$index]=$(effective_current_value "$index" 0); fi
@@ -1332,6 +1531,7 @@ apply_pending() {
     if [[ -z ${dirty_power[$index]+set} ]]; then target_power[$index]=$(effective_current_value "$index" 2); fi
     if [[ -z ${dirty_fan[$index]+set} ]]; then target_fan[$index]=$(effective_fan_target "$index"); fi
     if [[ -z ${dirty_vtt[$index]+set} ]]; then target_vtt[$index]=$(effective_current_value "$index" 4); fi
+    if [[ -z ${dirty_memlock[$index]+set} ]]; then target_memlock[$index]=$(effective_memlock "$index"); fi
     set_notice "Simulated apply complete for GPU ${index}. Hardware unchanged." "$green"
     return 0
 }
@@ -1350,6 +1550,7 @@ reset_selected() {
         if is_number "$stock"; then target_power[$index]=$stock; fi
     fi
     if is_number "$(effective_current_value "$index" 4)"; then target_vtt[$index]=0; fi
+    target_memlock[$index]=0
     target_fan[$index]=''
 
     field_is_pending "$index" 0 && dirty_core[$index]=1 || unset "dirty_core[$index]"
@@ -1361,7 +1562,8 @@ reset_selected() {
         [[ $(effective_current_value "$index" 3) != 0 ]] && dirty_fan[$index]=1 || unset "dirty_fan[$index]"
     fi
     field_is_pending "$index" 4 && dirty_vtt[$index]=1 || unset "dirty_vtt[$index]"
-    set_notice "Stock targets staged for GPU ${index}: 0/0/default-power/AUTO/0. Select [Apply] to commit." "$yellow"
+    field_is_pending "$index" 5 && dirty_memlock[$index]=1 || unset "dirty_memlock[$index]"
+    set_notice "Stock targets staged for GPU ${index}, including an unlocked memory clock. Select [Apply] to commit." "$yellow"
 }
 
 reset_all_gpus() {
@@ -1371,6 +1573,7 @@ reset_all_gpus() {
         if is_number "$(effective_current_value "$index" 1)"; then target_memory[$index]=0; dirty_memory[$index]=1; fi
         if is_number "${gpu_power_default[$index]-}"; then target_power[$index]=${gpu_power_default[$index]}; dirty_power[$index]=1; fi
         if is_number "$(effective_current_value "$index" 4)"; then target_vtt[$index]=0; dirty_vtt[$index]=1; fi
+        target_memlock[$index]=0
         target_fan[$index]=''
         [[ $(effective_current_value "$index" 3) != 0 ]] && dirty_fan[$index]=1 || unset "dirty_fan[$index]"
         # Re-evaluate pending so already-stock GPUs don't stay dirty.
@@ -1378,22 +1581,10 @@ reset_all_gpus() {
         field_is_pending "$index" 1 && dirty_memory[$index]=1 || unset "dirty_memory[$index]"
         field_is_pending "$index" 2 && dirty_power[$index]=1 || unset "dirty_power[$index]"
         field_is_pending "$index" 4 && dirty_vtt[$index]=1 || unset "dirty_vtt[$index]"
+        field_is_pending "$index" 5 && dirty_memlock[$index]=1 || unset "dirty_memlock[$index]"
         ((count++))
     done
     set_notice "Stock targets staged for all ${count} GPU(s). Select [Apply] per GPU to commit." "$yellow"
-}
-
-reset_and_apply() {
-    local index pending
-    index=$(selected_gpu_id)
-    [[ -n $index ]] || return
-    reset_selected
-    pending_count "$index" >/dev/null; pending=$PC
-    if (( pending == 0 )); then
-        set_notice "GPU ${index} is already at stock; nothing to reset." "$dim"
-        return
-    fi
-    apply_pending 1
 }
 
 save_file_path() {
@@ -1404,7 +1595,7 @@ save_file_path() {
 # Only allowed when nothing is still staged: the save must reflect a clean,
 # fully-applied state.
 save_plan() {
-    local index file dir core mem power fan vtt total
+    local index file dir core mem power fan vtt memlock total
     for index in "${gpu_indices[@]}"; do
         pending_count "$index" >/dev/null
         if (( PC > 0 )); then
@@ -1416,7 +1607,7 @@ save_plan() {
     dir=${file%/*}
     mkdir -p "$dir" 2>/dev/null || { set_notice "Cannot create ${dir}." "$red"; return 1; }
     {
-        printf '# gpuoc-tui save v1 %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || printf 'unknown')"
+        printf '# gpuoc-tui save v2 %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || printf 'unknown')"
         for index in "${gpu_indices[@]}"; do
             effective_current_value "$index" 0 >/dev/null; core=$ECV
             effective_current_value "$index" 1 >/dev/null; mem=$ECV
@@ -1424,8 +1615,9 @@ save_plan() {
             effective_fan_target "$index" >/dev/null
             if [[ -n $EFT ]]; then fan=$EFT; else fan=AUTO; fi
             effective_current_value "$index" 4 >/dev/null; vtt=$ECV
-            printf 'GPU %s %s core=%s mem=%s power=%s fan=%s vtt=%s\n' \
-                "$index" "${gpu_bus[$index]-unknown}" "$core" "$mem" "$power" "$fan" "$vtt"
+            memlock=$(effective_memlock "$index")
+            printf 'GPU %s %s core=%s mem=%s power=%s fan=%s vtt=%s memlock=%s\n' \
+                "$index" "${gpu_bus[$index]-unknown}" "$core" "$mem" "$power" "$fan" "$vtt" "$memlock"
         done
     } > "$file" || { set_notice "Cannot write ${file}." "$red"; return 1; }
     total=${#gpu_indices[@]}
@@ -1435,7 +1627,7 @@ save_plan() {
 # Stage a saved setup as pending targets (review + Apply, never applied
 # directly). Asks first when the current plan has staged changes.
 load_plan() {
-    local file line index bus core mem power fan vtt staged=0 matched=0 skipped=0 pending_total=0
+    local file line index bus core mem power fan vtt memlock staged=0 matched=0 skipped=0 pending_total=0
     file=$(save_file_path)
     [[ -f $file ]] || { set_notice 'No save found yet; press s once everything is applied.' "$dim"; return 1; }
     for index in "${gpu_indices[@]}"; do
@@ -1447,9 +1639,9 @@ load_plan() {
             || { set_notice 'Load cancelled.' "$dim"; return 1; }
     fi
     while IFS= read -r line || [[ -n $line ]]; do
-        [[ $line =~ ^GPU\ [0-9]+\ ([^[:space:]]+)\ core=([^[:space:]]+)\ mem=([^[:space:]]+)\ power=([^[:space:]]+)\ fan=([^[:space:]]+)\ vtt=([^[:space:]]+)$ ]] || continue
+        [[ $line =~ ^GPU\ [0-9]+\ ([^[:space:]]+)\ core=([^[:space:]]+)\ mem=([^[:space:]]+)\ power=([^[:space:]]+)\ fan=([^[:space:]]+)\ vtt=([^[:space:]]+)(\ memlock=([0-9]+))?$ ]] || continue
         bus=${BASH_REMATCH[1]}; core=${BASH_REMATCH[2]}; mem=${BASH_REMATCH[3]}
-        power=${BASH_REMATCH[4]}; fan=${BASH_REMATCH[5]}; vtt=${BASH_REMATCH[6]}
+        power=${BASH_REMATCH[4]}; fan=${BASH_REMATCH[5]}; vtt=${BASH_REMATCH[6]}; memlock=${BASH_REMATCH[8]-}
         index=''
         for index in "${gpu_indices[@]}"; do
             [[ ${gpu_bus[$index]-} == "$bus" ]] && break
@@ -1466,6 +1658,10 @@ load_plan() {
             target_fan[$index]=$fan
         fi
         if is_number "$vtt" || [[ $vtt == N/A ]]; then target_vtt[$index]=$vtt; fi
+        if [[ -n $memlock ]] && memlock_supported "$index" "$memlock"; then
+            target_memlock[$index]=$memlock
+            if (( memlock > 0 )); then target_memory[$index]=$(effective_current_value "$index" 1); fi
+        fi
         field_is_pending "$index" 0 && dirty_core[$index]=1 || unset "dirty_core[$index]"
         field_is_pending "$index" 1 && dirty_memory[$index]=1 || unset "dirty_memory[$index]"
         field_is_pending "$index" 2 && dirty_power[$index]=1 || unset "dirty_power[$index]"
@@ -1476,6 +1672,7 @@ load_plan() {
             [[ $ECV != 0 ]] && dirty_fan[$index]=1 || unset "dirty_fan[$index]"
         fi
         field_is_pending "$index" 4 && dirty_vtt[$index]=1 || unset "dirty_vtt[$index]"
+        field_is_pending "$index" 5 && dirty_memlock[$index]=1 || unset "dirty_memlock[$index]"
     done < "$file"
     for index in "${gpu_indices[@]}"; do
         pending_count "$index" >/dev/null
@@ -1501,8 +1698,8 @@ reset_field_to_stock() {
             field_is_pending "$index" 0 && dirty_core[$index]=1 || unset "dirty_core[$index]"
             ;;
         1)
-            if memlocked "$index"; then
-                set_notice "MEMORY locked at ${memlock_speed[$index]} MHz: offset slider disabled." "$yellow"
+            if memory_offset_target_locked "$index"; then
+                set_notice "MEMORY offset disabled by the fixed $(memlock_label "${target_memlock[$index]}") target." "$yellow"
                 return
             fi
             effective_current_value "$index" 1 >/dev/null
@@ -1530,6 +1727,10 @@ reset_field_to_stock() {
             is_number "$ECV" || { set_notice 'VTT is unavailable on this GPU or driver.' "$yellow"; return; }
             target_vtt[$index]=0
             field_is_pending "$index" 4 && dirty_vtt[$index]=1 || unset "dirty_vtt[$index]"
+            ;;
+        5)
+            target_memlock[$index]=0
+            field_is_pending "$index" 5 && dirty_memlock[$index]=1 || unset "dirty_memlock[$index]"
             ;;
         *)
             reset_selected
@@ -1560,7 +1761,7 @@ slider_for_field() {
             ;;
         1)
             target=${target_memory[$index]-N/A}
-            if memlocked "$index"; then SLD="[ locked @ ${memlock_speed[$index]} MHz ]"; printf '%s' "$SLD"; return; fi
+            if memory_offset_target_locked "$index"; then SLD="[ disabled @ ${target_memlock[$index]} MHz ]"; printf '%s' "$SLD"; return; fi
             cap=$CAP_MEM; is_number "$cap" || cap=3000
             if (( cap == 0 )); then SLD='[     locked      ]'; printf '%s' "$SLD"; return; fi
             minimum=-$cap; maximum=$cap; default=0
@@ -1586,6 +1787,12 @@ slider_for_field() {
             cap=$CAP_VTT; is_number "$cap" || cap=50
             if (( cap == 0 )); then SLD='[     locked      ]'; printf '%s' "$SLD"; return; fi
             minimum=-$cap; maximum=$cap; default=0
+            ;;
+        5)
+            target=${target_memlock[$index]-0}
+            minimum=0; default=0
+            maximum=0
+            for cap in ${memspd_choices[$index]-}; do maximum=$cap; done
             ;;
     esac
     is_number "$target" || { SLD='[       N/A       ]'; printf '%s' "$SLD"; return; }
@@ -1623,12 +1830,8 @@ limit_for_field() {
     case $field in
         0) cap=$CAP_CORE; printf -v LIM '[+/-%s]' "$cap" ;;
         1)
-            if memlocked "$index"; then
-                if [[ -n ${memspd_min[$index]-} && -n ${memspd_max[$index]-} ]]; then
-                    printf -v LIM '[%s-%s]' "${memspd_min[$index]}" "${memspd_max[$index]}"
-                else
-                    LIM='[mem lock]'
-                fi
+            if memory_offset_target_locked "$index"; then
+                LIM='[fixed clock]'
             else
                 cap=$CAP_MEM
                 if (( cap == 0 )); then LIM='[locked]'; else printf -v LIM '[+/-%s]' "$cap"; fi
@@ -1645,8 +1848,20 @@ limit_for_field() {
             ;;
         3) LIM='[20-100]' ;;
         4)
-            cap=$CAP_VTT
-            if (( cap == 0 )); then LIM='[locked]'; else printf -v LIM '[+/-%s]' "$cap"; fi
+            effective_current_value "$index" 4 >/dev/null
+            if ! is_number "$ECV"; then
+                LIM='[UNSUPPORTED]'
+            else
+                cap=$CAP_VTT
+                if (( cap == 0 )); then LIM='[locked]'; else printf -v LIM '[+/-%s]' "$cap"; fi
+            fi
+            ;;
+        5)
+            if [[ -n ${memspd_choices[$index]-} ]]; then
+                LIM="[DEFAULT,${memspd_choices[$index]// /,}]"
+            else
+                LIM='[DEFAULT only]'
+            fi
             ;;
     esac
     printf '%s' "$LIM"
@@ -1655,13 +1870,14 @@ limit_for_field() {
 STP=''
 step_for_field() {
     local index=$1 field=$2
-    if (( field == 1 )) && memlocked "$index"; then STP='locked'; printf '%s' "$STP"; return; fi
+    if (( field == 1 )) && memory_offset_target_locked "$index"; then STP='disabled'; printf '%s' "$STP"; return; fi
     case $field in
         0) STP='+/-25' ;;
         1) STP='+/-50' ;;
         2) STP='+/-5W' ;;
         3) STP='+/-5%' ;;
         4) STP='+/-5mV' ;;
+        5) STP='supported' ;;
     esac
     printf '%s' "$STP"
 }
@@ -1674,6 +1890,7 @@ draw_control() {
         2) label='POWER' ;;
         3) label='FAN' ;;
         4) label='Core Offset(VTT)' ;;
+        5) label='MEM LOCK' ;;
     esac
     caps_for_index "$index"
     field_current_display "$index" "$field" >/dev/null; current=$FCD
@@ -1705,7 +1922,7 @@ draw_control() {
     printf '      %s%s%s  %s\n' "$color" "$slider" "$reset" "$step"
 }
 
-render_frame() {
+render_compact_frame() {
     local index marker color selected count live_fan section_heading summary
     printf '%s%s GPUOC TUI %s%s  NVIDIA overclock controls' "$bold" "$cyan" "$gpuoc_tui_version" "$reset"
     printf '  %s[SIMULATION ONLY]%s' "$yellow" "$reset"
@@ -1796,25 +2013,27 @@ render_frame() {
     printf '\n'
     draw_control "$selected" 4
     printf '\n'
+    draw_control "$selected" 5
+    printf '\n'
     for index in "${gpu_indices[@]}"; do
         if memlocked "$index"; then
-            printf '  %sMEMORY locked on GPU %s at %s MHz: offset slider disabled (nvidia-smi -lmc).%s\n' \
-                "$yellow" "$index" "${memlock_speed[$index]}" "$reset"
+            printf '  %sMEMORY offset disabled on GPU %s: lock at %s MHz.%s\n' \
+                "$yellow" "$index" "$(effective_memlock "$index")" "$reset"
         fi
     done
     printf '\n'
     equals_line
     printf '\n'
     if [[ $screen == settings ]]; then
-        if (( selected_field == 5 )); then
+        if (( selected_field == 6 )); then
             printf '  %s> [Apply]%s      Commit staged targets (sim only)\n\n' "$yellow" "$reset"
         else
             printf '  %s  [Apply]%s      Commit staged targets (sim only)\n\n' "$dim" "$reset"
         fi
-        if (( selected_field == 6 )); then
-            printf '  %s> [Full Reset]%s  Stock: 0/0/default/AUTO/0 + apply\n\n' "$yellow" "$reset"
+        if (( selected_field == 7 )); then
+            printf '  %s> [Reset]%s       Stage stock targets; Apply commits\n\n' "$yellow" "$reset"
         else
-            printf '  %s  [Full Reset]%s  Stock: 0/0/default/AUTO/0 + apply\n\n' "$dim" "$reset"
+            printf '  %s  [Reset]%s       Stage stock targets; Apply commits\n\n' "$dim" "$reset"
         fi
     else
         pending_count "$selected" >/dev/null; count=$PC
@@ -1843,6 +2062,281 @@ render_frame() {
     fi
 }
 
+# The wide console mirrors the 88-column layout while keeping each row exactly
+# 88 display cells. Build text without embedded SGR codes, then color the whole
+# row: byte counts from the telemetry locale must never become border padding.
+UI_INNER=86
+ui_line() {
+    local LC_ALL=C.UTF-8 content=${1-} color=${2:-$cyan} pad
+    if (( ${#content} > UI_INNER )); then content=${content:0:UI_INNER}; fi
+    printf -v pad '%*s' "$((UI_INNER - ${#content}))" ''
+    printf '%s║%s%s║%s\n' "$color" "$content" "$pad" "$reset"
+}
+
+ui_rule() {
+    local LC_ALL=C.UTF-8 left=$1 middle=$2 right=$3 title=${4-} color=${5:-$cyan} prefix='' fill pad
+    [[ -n $title ]] && prefix="${middle}${middle} ${title} "
+    pad=$((UI_INNER - ${#prefix}))
+    printf -v fill '%*s' "$pad" ''
+    fill=${fill// /$middle}
+    printf '%s%s%s%s%s%s\n' "$color" "$left" "$prefix" "$fill" "$right" "$reset"
+}
+
+ui_card_border() {
+    local fill side=$1
+    printf -v fill '%80s' ''
+    fill=${fill// /─}
+    if [[ $side == top ]]; then
+        ui_line "  ┌${fill}┐  "
+    else
+        ui_line "  └${fill}┘  "
+    fi
+}
+
+ui_card_line() {
+    local LC_ALL=C.UTF-8 content text=${1-} color=${2:-$cyan} pad
+    if (( ${#text} > 78 )); then text=${text:0:78}; fi
+    printf -v pad '%*s' "$((78 - ${#text}))" ''
+    content="  │ ${text}${pad} │  "
+    ui_line "$content" "$color"
+}
+
+UI_PADDED=''
+ui_pad() {
+    local LC_ALL=C.UTF-8 value=${1-} width=$2 pad
+    if (( ${#value} > width )); then value=${value:0:width}; fi
+    printf -v pad '%*s' "$((width - ${#value}))" ''
+    UI_PADDED="${value}${pad}"
+}
+
+ui_control_label() {
+    case $1 in
+        0) printf 'CORE CLOCK' ;;
+        1) printf 'MEMORY OFFSET' ;;
+        2) printf 'POWER LIMIT' ;;
+        3) printf 'FAN SPEED' ;;
+        4) printf 'CORE VOLTAGE' ;;
+        5) printf 'MEMORY SPEED' ;;
+    esac
+}
+
+# One-cell markers keep the current, staged, and stock points visible even
+# when they overlap. The lock and unsupported rows get an explicit message.
+ui_meter() {
+    local index=$1 field=$2 color=$3 min max stock current target step track='' glyph
+    local i width=55 current_pos=-1 target_pos=-1 stock_pos=-1 message=''
+    step_for_field "$index" "$field" >/dev/null; step=$STP
+    case $field in
+        0)
+            min=-$CAP_CORE; max=$CAP_CORE; stock=0
+            effective_current_value "$index" 0 >/dev/null; current=$ECV
+            target=${target_core[$index]-N/A}
+            ;;
+        1)
+            if memory_offset_target_locked "$index"; then
+                message="DISABLED BY FIXED ${target_memlock[$index]} MHz MEMORY SPEED"
+            else
+                min=-$CAP_MEM; max=$CAP_MEM; stock=0
+                effective_current_value "$index" 1 >/dev/null; current=$ECV
+                memlocked "$index" && current='N/A'
+                target=${target_memory[$index]-N/A}
+            fi
+            ;;
+        2)
+            min=${gpu_power_min[$index]-N/A}; max=${gpu_power_max[$index]-N/A}
+            stock=${gpu_power_default[$index]-N/A}
+            effective_current_value "$index" 2 >/dev/null; current=$ECV
+            target=${target_power[$index]-N/A}
+            ;;
+        3)
+            min=20; max=100; stock='N/A'
+            effective_current_value "$index" 3 >/dev/null; current=$ECV
+            target=${target_fan[$index]-}
+            [[ -z $target ]] && message='AUTO FAN CONTROL'
+            (( current == 0 )) && current='N/A'
+            ;;
+        4)
+            min=-$CAP_VTT; max=$CAP_VTT; stock=0
+            effective_current_value "$index" 4 >/dev/null; current=$ECV
+            target=${target_vtt[$index]-N/A}
+            if ! is_number "$current"; then message='NOT AVAILABLE'; step=''; fi
+            ;;
+        5)
+            min=0; max=0; stock=0
+            for i in ${memspd_choices[$index]-}; do max=$i; done
+            current=$(effective_memlock "$index")
+            target=${target_memlock[$index]-0}
+            step='reported clock'
+            ;;
+    esac
+    if [[ -z $message ]]; then
+        if ! is_number "${min-}" || ! is_number "${max-}" || ! is_number "${target-}" || (( max <= min )); then
+            message='NOT AVAILABLE'
+        fi
+    fi
+    if [[ -n $message ]]; then
+        ui_pad "── ${message} ──" "$width"; track=$UI_PADDED
+        ui_line "    ╭${track}╮  ${step}" "$color"
+        return
+    fi
+    (( target < min )) && target=$min
+    (( target > max )) && target=$max
+    target_pos=$(( (target - min) * (width - 1) / (max - min) ))
+    if is_number "$current"; then
+        (( current < min )) && current=$min
+        (( current > max )) && current=$max
+        current_pos=$(( (current - min) * (width - 1) / (max - min) ))
+    fi
+    if is_number "$stock"; then
+        (( stock < min )) && stock=$min
+        (( stock > max )) && stock=$max
+        stock_pos=$(( (stock - min) * (width - 1) / (max - min) ))
+    fi
+    for (( i=0; i<width; i++ )); do
+        glyph='░'
+        (( i < target_pos )) && glyph='━'
+        if (( i == stock_pos )); then glyph='S'; fi
+        if (( i == current_pos )); then glyph='C'; fi
+        if (( i == target_pos )); then glyph='T'; fi
+        if (( i == current_pos && i == target_pos )); then glyph='◎'; fi
+        track+=$glyph
+    done
+    ui_line "    ╭${track}╮  ${step}" "$color"
+}
+
+ui_control_row() {
+    local LC_ALL=C.UTF-8 index=$1 field=$2 label current target limit marker=' ' color=$reset content
+    label=$(ui_control_label "$field")
+    field_current_display "$index" "$field" >/dev/null; current=$FCD
+    field_target_display "$index" "$field" >/dev/null; target=$FTD
+    limit_for_field "$index" "$field" >/dev/null; limit=$LIM
+    if [[ $screen == settings ]]; then color=$cyan; fi
+    if [[ $screen == settings ]] && (( selected_field == field )); then marker='▶'; color="$bold$bright_yellow"; fi
+    if field_is_pending "$index" "$field"; then target+=' ◈'; fi
+    content="  ${marker} "
+    ui_pad "$label" 17; content+="$UI_PADDED "
+    ui_pad "$current" 12; content+="$UI_PADDED "
+    ui_pad "$target" 13; content+="$UI_PADDED "
+    ui_pad "$limit" 29; content+=$UI_PADDED
+    ui_line "$content" "$color"
+    ui_meter "$index" "$field" "$color"
+    ui_line '' "$cyan"
+}
+
+render_console_frame() {
+    local LC_ALL=C.UTF-8 selected index marker color content status temp draw limit vram logo pad num
+    local gclk mclk ftemp fdraw flim fmem fan count pstate precision label value
+    UI_INNER=86
+    ui_rule '╔' '═' '╗' '' "$green"
+    logo='▄▀▀ ▄▀▄ █ █ ▄▀▄ ▄▀▀'
+    content="  ${logo}      GPU OVERCLOCK CONTROL"
+    printf -v pad '%*s' "$((UI_INNER - ${#content} - ${#gpuoc_tui_version} - 3))" ''
+    content+="${pad}v${gpuoc_tui_version}"
+    ui_line "$content" "$bold$bright_green"
+    content='  ▀▄▄ ▀▀▀ ▀▀▀ ▀▀▀ ▀▄▄      SOJUN ENGINEERING'
+    status='◈ SIMULATION'
+    printf -v pad '%*s' "$((UI_INNER - ${#content} - ${#status} - 3))" ''
+    ui_line "${content}${pad}${status}" "$green"
+    printf -v content 'DEVICE SELECTOR  ·  %02d GPUs DETECTED' "${#gpu_indices[@]}"
+    ui_rule '╠' '═' '╣' "$content" "$bright_green"
+
+    if ((${#gpu_indices[@]} == 0)); then
+        ui_line '  No NVIDIA GPUs detected.' "$red"
+        ui_line "  ${notice:-Press q to quit.}" "$notice_color"
+        ui_rule '╚' '═' '╝'
+        return
+    fi
+    selected_gpu_id >/dev/null; selected=$SEL
+    for index in "${gpu_indices[@]}"; do
+        marker=' '; status='● ONLINE'; color=$green
+        if [[ $index == "$selected" ]]; then
+            marker='▌'; status='◀ ACTIVE'; color="$bold$bright_green"
+            [[ $screen == settings ]] && color=$yellow
+        fi
+        round_number "${gpu_temp[$index]-N/A}"; temp=$ROUNDED
+        round_number "${gpu_power_draw[$index]-N/A}"; draw=$ROUNDED
+        round_number "${gpu_power_limit[$index]-N/A}"; limit=$ROUNDED
+        fmt_memory "${gpu_memory_used[$index]-N/A}" "${gpu_memory_total[$index]-N/A}" >/dev/null
+        vram=${FMT%% (*}
+        printf -v num '%02d' "$index"
+        content="  ${marker} ${num}  "
+        ui_pad "${gpu_name[$index]-unknown}" 15; content+="$UI_PADDED "
+        ui_pad "${temp}°C" 6; content+="$UI_PADDED "
+        ui_pad "${draw}W / ${limit}W" 14; content+="$UI_PADDED "
+        ui_pad "$vram" 18; content+="$UI_PADDED "
+        ui_pad "$status" 10; content+=$UI_PADDED
+        ui_line "$content" "$color"
+    done
+    [[ -n $selected && -n ${gpu_name[$selected]-} ]] || { ui_line '  Selected GPU is unavailable.' "$red"; ui_rule '╚' '═' '╝'; return; }
+    printf -v content 'GPU %02d  /  %s' "$selected" "${gpu_name[$selected]}"
+    ui_rule '╟' '─' '╢' "$content"
+    round_number "${gpu_graphics_clock[$selected]-N/A}"; gclk=$ROUNDED
+    round_number "${gpu_memory_clock[$selected]-N/A}"; mclk=$ROUNDED
+    round_number "${gpu_temp[$selected]-N/A}"; ftemp=$ROUNDED
+    round_number "${gpu_power_draw[$selected]-N/A}"; fdraw=$ROUNDED
+    round_number "${gpu_power_limit[$selected]-N/A}"; flim=$ROUNDED
+    round_number "${gpu_fan[$selected]-N/A}"; fan=$ROUNDED
+    content='  '
+    ui_pad "GPU ${gclk} MHz" 17; content+=$UI_PADDED
+    ui_pad "MEM ${mclk} MHz" 16; content+=$UI_PADDED
+    ui_pad "TEMP ${ftemp}°C" 15; content+=$UI_PADDED
+    ui_pad "POWER ${fdraw} W" 17; content+=$UI_PADDED
+    content+="FAN ${fan}%"
+    ui_line "$content" "$green"
+    fmt_memory "${gpu_memory_used[$selected]-N/A}" "${gpu_memory_total[$selected]-N/A}" >/dev/null
+    fmem=${FMT%% (*}
+    printf -v content '  P-STATE %-8s  POWER LIMIT %-8s  VRAM %s' "${gpu_pstate[$selected]-N/A}" "$flim W" "$fmem"
+    ui_line "$content"
+
+    ui_rule '╠' '═' '╣' 'TUNING MATRIX'
+    ui_line '    CONTROL           CURRENT      TARGET        HARDWARE RANGE' "$bold$cyan"
+    ui_rule '╟' '─' '╢'
+    caps_for_index "$selected"
+    for index in 0 1 2 3 4 5; do ui_control_row "$selected" "$index"; done
+    ui_line '  C = CURRENT     T = TARGET     S = STOCK     ◎ = MATCH     ◈ = MODIFIED' "$dim"
+
+    ui_rule '╠' '═' '╣' 'PRECISION INPUT'
+    if (( numeric_entry )); then
+        label=$(ui_control_label "$selected_field")
+        value="${numeric_buffer}█"
+        precision='ENTER confirm     ESC cancel     ←/→ fine adjust'
+    elif [[ $screen == settings ]]; then
+        if (( selected_field <= 5 )); then
+            label=$(ui_control_label "$selected_field")
+            field_target_display "$selected" "$selected_field" >/dev/null; value=$FTD
+            precision='ENTER edit exact target     ←/→ adjust     ESC back'
+        else
+            label='CONTROL DECK'; value='F5 Apply  /  F6 Reset'
+            precision='F5 apply staged values     F6 stage stock targets'
+        fi
+    else
+        label='READ ONLY'; value='Select a GPU, then press ENTER to edit'
+        precision='↑/↓ choose GPU     ENTER lock selection     TAB next GPU'
+    fi
+    ui_line "    ${label}" "$bold$yellow"
+    ui_card_border top
+    ui_card_line "${value}" "$yellow"
+    ui_card_border bottom
+    ui_line "    ${precision}" "$dim"
+
+    ui_rule '╠' '═' '╣' 'CONTROL DECK'
+    ui_line '    [ F5 APPLY ]      [ F6 RESET ]      [ F7 SAVE ]      [ F8 LOAD ]' "$bold$yellow"
+    ui_line '    ↑↓ SELECT      ←→ ADJUST      ENTER EDIT      TAB GPU      ? HELP' "$cyan"
+    if [[ -n $notice ]]; then ui_line "  ${notice}" "$notice_color"; else ui_line '  Ready.' "$dim"; fi
+    pending_count "$selected" >/dev/null; count=$PC
+    printf -v content '  ◈ %02d PENDING CHANGE(S)       ● GPU CONNECTED       SIMULATION: WRITES DISABLED' "$count"
+    ui_line "$content" "$bold$green"
+    ui_rule '╚' '═' '╝'
+}
+
+render_frame() {
+    if (( TERM_W >= 88 && TERM_H >= 41 + ${#gpu_indices[@]} )); then
+        render_console_frame
+    else
+        render_compact_frame
+    fi
+}
+
 draw() {
     local frame drawn_frame
     # Build the complete frame before moving the cursor. Overwrite each line
@@ -1859,10 +2353,11 @@ draw_help() {
     if [[ $screen == picker ]]; then
         printf '  %sUp / k%s      Previous GPU\n' "$cyan" "$reset"
         printf '  %sDn / j%s      Next GPU\n' "$cyan" "$reset"
+        printf '  %sTab%s         Next GPU\n' "$cyan" "$reset"
         printf '  %sEnter%s       Edit the visible settings for the selected GPU\n' "$cyan" "$reset"
-        printf '  %sR%s           Stage stock targets for ALL GPUs\n' "$cyan" "$reset"
+        printf '  %sF7%s          Save the applied setup\n' "$cyan" "$reset"
         printf '  %ss%s           Save the applied setup (only when nothing is staged)\n' "$cyan" "$reset"
-        printf '  %sl%s           Load the save as staged targets (asks before replacing plan)\n' "$cyan" "$reset"
+        printf '  %sF5/F6/F8%s    Available after Enter locks a GPU\n' "$cyan" "$reset"
         printf '  %sEsc / q%s     Quit\n\n' "$cyan" "$reset"
     elif (( numeric_entry )); then
         printf '  %sLeft/Right%s  Decrease/increase by the setting step\n' "$cyan" "$reset"
@@ -1874,8 +2369,10 @@ draw_help() {
         printf '  %sUp / k%s      Previous setting (wraps Apply/Reset)\n' "$cyan" "$reset"
         printf '  %sDn / j%s      Next setting (wraps Apply/Reset)\n' "$cyan" "$reset"
         printf '  %sLeft / h%s    Decrease target by the displayed step\n' "$cyan" "$reset"
-        printf '  %sRight / l%s   Increase target by the displayed step\n' "$cyan" "$reset"
+        printf '  %sRight%s       Increase target by the displayed step\n' "$cyan" "$reset"
         printf '  %sEnter%s       Open exact number entry, or activate Apply/Reset\n' "$cyan" "$reset"
+        printf '  %sMEM LOCK%s    DEFAULT (0) uses full range + offset; fixed MHz disables offset\n' "$cyan" "$reset"
+        printf '               50 series: 810; 30/40 series: supported 810/5000/5001/6000\n'
         printf '  %s+ / = / - / _%s Adjust selected target\n' "$cyan" "$reset"
         printf '  %s0%s           Discard selected target change\n' "$cyan" "$reset"
         printf '  %sa%s           Simulate applying pending changes\n' "$cyan" "$reset"
@@ -1883,17 +2380,54 @@ draw_help() {
         printf '  %sR%s           Stage stock for ALL GPUs\n' "$cyan" "$reset"
         printf '  %ss%s           Save the applied setup (only when nothing is staged)\n' "$cyan" "$reset"
         printf '  %sl%s           Load the save as staged targets (asks before replacing plan)\n' "$cyan" "$reset"
-        printf '  %sDn to [Apply]/[Full Reset], Enter%s Commit in simulation only\n' "$cyan" "$reset"
+        printf '  %sF5 / F6 / F7 / F8%s Apply / stage Reset / Save / Load\n' "$cyan" "$reset"
+        printf '  %sTab%s         Switch GPU after resolving pending changes\n' "$cyan" "$reset"
+        printf '  %sDn to [Apply]/[Reset], Enter%s Commit or stage in simulation only\n' "$cyan" "$reset"
         printf '  %sEsc%s         Return to GPU list; choose apply, discard, or cancel when edits are pending\n' "$cyan" "$reset"
         printf '  %sq%s           Quit\n\n' "$cyan" "$reset"
     fi
-    printf '%sTarget edits stay staged until Apply/Full Reset; GPU writes are disabled.%s\n' "$yellow" "$reset"
-    printf '%sLocked MEMORY rows (nvidia-smi -lmc) show LOCKED; the offset slider does nothing there.%s\n' "$dim" "$reset"
+    printf '%sTarget edits and Reset stay staged until Apply; GPU writes are disabled.%s\n' "$yellow" "$reset"
+    printf '%sFixed MEMORY targets disable the offset; DEFAULT restores offset editing.%s\n' "$dim" "$reset"
     printf '%sPress any key to return.%s' "$dim" "$reset"
 }
 
+read_escape_key() {
+    local second third next digits
+    if ! IFS= read -r -s -n1 -t 0.05 second; then printf 'ESC'; return; fi
+    if [[ $second != '[' && $second != O ]]; then printf 'ESC'; return; fi
+    if ! IFS= read -r -s -n1 -t 0.05 third; then printf 'ESC'; return; fi
+    case $third in
+        A) printf 'UP'; return ;;
+        B) printf 'DOWN'; return ;;
+        C) printf 'RIGHT'; return ;;
+        D) printf 'LEFT'; return ;;
+        P) [[ $second == O ]] && { printf 'F1'; return; } ;;
+        Q) [[ $second == O ]] && { printf 'F2'; return; } ;;
+    esac
+    if [[ $second == '[' && $third =~ ^[0-9]$ ]]; then
+        digits=$third
+        while IFS= read -r -s -n1 -t 0.05 next; do
+            [[ $next == '~' ]] && break
+            [[ $next =~ ^[0-9]$ ]] || { printf 'UNKNOWN'; return; }
+            digits+=$next
+            ((${#digits} <= 3)) || { printf 'UNKNOWN'; return; }
+        done
+        case $digits in
+            11) printf 'F1' ;;
+            12) printf 'F2' ;;
+            15) printf 'F5' ;;
+            17) printf 'F6' ;;
+            18) printf 'F7' ;;
+            19) printf 'F8' ;;
+            *) printf 'UNKNOWN' ;;
+        esac
+        return
+    fi
+    printf 'UNKNOWN'
+}
+
 read_key() {
-    local first second third
+    local first
     if ! IFS= read -r -s -n1 -t "$refresh_interval" first; then
         printf '__TIMEOUT__'
         return
@@ -1903,21 +2437,7 @@ read_key() {
         return
     fi
     case $first in
-        $'\e')
-            if ! IFS= read -r -s -n1 -t 0.05 second; then
-                printf 'ESC'
-            elif [[ $second == '[' || $second == 'O' ]] && IFS= read -r -s -n1 -t 0.05 third; then
-                case $third in
-                    A) printf 'UP' ;;
-                    B) printf 'DOWN' ;;
-                    C) printf 'RIGHT' ;;
-                    D) printf 'LEFT' ;;
-                    *) printf 'ESC' ;;
-                esac
-            else
-                printf 'ESC'
-            fi
-            ;;
+        $'\e') read_escape_key ;;
         $'\t') printf 'TAB' ;;
         $'\r'|$'\n') printf 'ENTER' ;;
         $'\177'|$'\b') printf 'BACKSPACE' ;;
@@ -1939,28 +2459,14 @@ read_key_blocking() {
 # continuations get a short grace window (burst bytes arrive together).
 EXTRA=''
 read_extra_key() {
-    local b1 b2 b3 dummy
+    local b1 dummy
     EXTRA=''
     IFS= read -r -s -n1 -t 0 dummy || return 1
     IFS= read -r -s -n1 -t 0.05 b1 || return 1
     if [[ -z $b1 ]]; then EXTRA='ENTER'; return 0; fi
     case $b1 in
-        $'\e')
-            IFS= read -r -s -n1 -t 0.02 b2 || { EXTRA='ESC'; return 0; }
-            if [[ $b2 == '[' || $b2 == 'O' ]]; then
-                IFS= read -r -s -n1 -t 0.02 b3 || { EXTRA='ESC'; return 0; }
-                case $b3 in
-                    A) EXTRA='UP' ;;
-                    B) EXTRA='DOWN' ;;
-                    C) EXTRA='RIGHT' ;;
-                    D) EXTRA='LEFT' ;;
-                    *) EXTRA='ESC' ;;
-                esac
-            else
-                EXTRA='ESC'
-            fi
-            ;;
-        $'\t') EXTRA='DOWN' ;;
+        $'\e') EXTRA=$(read_escape_key) ;;
+        $'\t') EXTRA='TAB' ;;
         $'\r'|$'\n') EXTRA='ENTER' ;;
         h) EXTRA='LEFT' ;;
         k) EXTRA='UP' ;;
@@ -1975,10 +2481,51 @@ read_extra_key() {
 
 handle_key() {
     local key=$1
+    case $key in
+        F1) set_theme matrix; return ;;
+        F2) set_theme amber; return ;;
+        q|Q) exit 0 ;;
+    esac
     if (( numeric_entry )); then
         handle_numeric_entry_key "$key"
         return
     fi
+    case $key in
+        F5)
+            if [[ $screen == settings ]]; then apply_pending 1; else set_notice 'Press Enter to lock a GPU before applying.' "$dim"; fi
+            return
+            ;;
+        F6)
+            if [[ $screen == settings ]]; then reset_selected; else set_notice 'Press Enter to lock a GPU before resetting.' "$dim"; fi
+            return
+            ;;
+        F7)
+            save_plan
+            return
+            ;;
+        F8)
+            if [[ $screen == settings ]]; then load_plan; else set_notice 'Press Enter to lock a GPU before loading targets.' "$dim"; fi
+            return
+            ;;
+        TAB)
+            local resume_edit=0
+            ((${#gpu_indices[@]} > 0)) || { set_notice 'No GPU is available to select.' "$dim"; return; }
+            if [[ $screen == settings ]]; then
+                leave_settings picker || return
+                resume_edit=1
+            fi
+            selected_gpu=$(( (selected_gpu + 1) % ${#gpu_indices[@]} ))
+            if (( resume_edit )); then
+                active_gpu=$(selected_gpu_id)
+                screen='settings'
+                selected_field=0
+                set_notice "Editing ${gpu_name[$active_gpu]}. GPU locked; Tab switches GPU." "$yellow"
+            else
+                set_notice "Selected GPU $(selected_gpu_id). Press Enter to edit." "$dim"
+            fi
+            return
+            ;;
+    esac
     if [[ $screen == picker ]]; then
         case $key in
             UP|k)
@@ -1999,13 +2546,13 @@ handle_key() {
                 set_notice "Editing ${gpu_name[$active_gpu]}. GPU locked; use Esc to return." "$yellow"
                 ;;
             r|R)
-                reset_all_gpus
+                set_notice 'Press Enter to lock a GPU before resetting targets.' "$dim"
                 ;;
             s|S)
                 save_plan
                 ;;
             l|L)
-                load_plan
+                set_notice 'Press Enter to lock a GPU before loading targets.' "$dim"
                 ;;
             ESC|q|Q)
                 exit 0
@@ -2022,47 +2569,47 @@ handle_key() {
     case $key in
         UP|k)
             selected_field=$((selected_field - 1))
-            (( selected_field < 0 )) && selected_field=6
+            (( selected_field < 0 )) && selected_field=7
             set_notice "Editing $(field_name) target." "$dim"
             ;;
-        DOWN|j|TAB)
+        DOWN|j)
             selected_field=$((selected_field + 1))
-            (( selected_field > 6 )) && selected_field=0
+            (( selected_field > 7 )) && selected_field=0
             set_notice "Editing $(field_name) target." "$dim"
             ;;
         LEFT|h)
-            if (( selected_field >= 5 )); then
-                set_notice 'Select [Apply]/[Full Reset] with Enter to commit.' "$dim"
+            if (( selected_field >= 6 )); then
+                set_notice 'Use Enter on [Apply]/[Reset], or F5/F6.' "$dim"
             else
                 adjust_selected -1
             fi
             ;;
-        RIGHT|l)
-            if (( selected_field >= 5 )); then
-                set_notice 'Select [Apply]/[Full Reset] with Enter to commit.' "$dim"
+        RIGHT)
+            if (( selected_field >= 6 )); then
+                set_notice 'Use Enter on [Apply]/[Reset], or F5/F6.' "$dim"
             else
                 adjust_selected 1
             fi
             ;;
         ENTER)
-            if (( selected_field == 5 )); then
+            if (( selected_field == 6 )); then
                 apply_pending 1
-            elif (( selected_field == 6 )); then
-                reset_and_apply
+            elif (( selected_field == 7 )); then
+                reset_selected
             else
                 begin_numeric_entry
             fi
             ;;
         +|=)
-            if (( selected_field >= 5 )); then
-                set_notice 'Select [Apply]/[Full Reset] with Enter to commit.' "$dim"
+            if (( selected_field >= 6 )); then
+                set_notice 'Use Enter on [Apply]/[Reset], or F5/F6.' "$dim"
             else
                 adjust_selected 1
             fi
             ;;
         -|_)
-            if (( selected_field >= 5 )); then
-                set_notice 'Select [Apply]/[Full Reset] with Enter to commit.' "$dim"
+            if (( selected_field >= 6 )); then
+                set_notice 'Use Enter on [Apply]/[Reset], or F5/F6.' "$dim"
             else
                 adjust_selected -1
             fi
@@ -2074,7 +2621,7 @@ handle_key() {
             apply_pending
             ;;
         r)
-            if (( selected_field <= 4 )); then
+            if (( selected_field <= 5 )); then
                 reset_field_to_stock
             else
                 reset_selected
@@ -2110,6 +2657,12 @@ while [[ $# -gt 0 ]]; do
             refresh_interval=$2
             shift 2
             ;;
+        --theme)
+            [[ $# -ge 2 ]] || die '--theme requires matrix or amber.'
+            theme=$2
+            theme_from_cli=1
+            shift 2
+            ;;
         --dry-run)
             dry_run=1
             shift
@@ -2127,6 +2680,9 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+[[ ${theme_from_cli:-0} == 1 ]] || load_theme
+configure_theme
 
 if [[ ! $refresh_interval =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]] || \
     ! awk -v value="$refresh_interval" 'BEGIN { exit !(value > 0) }'; then
@@ -2147,7 +2703,7 @@ cleanup() {
 trap cleanup EXIT
 trap 'cleanup; exit 130' INT TERM
 trap 'update_term_size' WINCH
-printf '\033[?25l'
+printf '\033[?25l%s' "$reset"
 update_term_size
 
 discover_settings_gpus
@@ -2176,9 +2732,9 @@ while :; do
     if (( ! numeric_entry )); then
         case $key in
             LEFT|h) key=LEFT ;;
-            RIGHT|l) key=RIGHT ;;
+            RIGHT) key=RIGHT ;;
             UP|k) key=UP ;;
-            DOWN|j|TAB) key=DOWN ;;
+            DOWN|j) key=DOWN ;;
             +|=) key=RIGHT ;;
             -|_) key=LEFT ;;
             *) handle_key "$key"; continue ;;
